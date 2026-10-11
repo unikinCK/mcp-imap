@@ -51,6 +51,8 @@ export interface TokenRecord {
   expiresAt: number;
 }
 
+export const MIN_PASSWORD_LENGTH = 10;
+
 const now = () => Math.floor(Date.now() / 1000);
 
 const SCHEMA = `
@@ -155,7 +157,9 @@ export class Store {
     if (!/^[A-Za-z0-9._@+-]{2,100}$/.test(name)) {
       throw new Error('Username must be 2-100 characters: letters, digits and . _ @ + -');
     }
-    if (password.length < 10) throw new Error('Password must be at least 10 characters long.');
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      throw new Error(`Password must be at least ${MIN_PASSWORD_LENGTH} characters long.`);
+    }
     if (this.findUser(name)) throw new Error(`User "${name}" already exists.`);
     const hash = await hashPassword(password);
     const result = this.db
@@ -192,7 +196,9 @@ export class Store {
   }
 
   async setPassword(userId: number, password: string): Promise<void> {
-    if (password.length < 10) throw new Error('Password must be at least 10 characters long.');
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      throw new Error(`Password must be at least ${MIN_PASSWORD_LENGTH} characters long.`);
+    }
     const hash = await hashPassword(password);
     this.db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, userId);
   }

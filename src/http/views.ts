@@ -65,13 +65,21 @@ export function page(opts: PageOptions, body: string): string {
   }${body}</main></body></html>`;
 }
 
-export function loginPage(opts: PageOptions & { next: string; username?: string; allowRegistration: boolean }): string {
+function signInContext(host: string, clientName?: string): string {
+  return `<p>Server <code>${esc(host)}</code></p>${
+    clientName ? `<p>Sign in to connect <strong>${esc(clientName)}</strong> to your mailboxes.</p>` : ''
+  }<p class="muted">Use your mcp-imap account (created by the server administrator), not the password of your email account.</p>`;
+}
+
+export function loginPage(
+  opts: PageOptions & { next: string; username?: string; allowRegistration: boolean; host: string; clientName?: string },
+): string {
   return page(
     opts,
-    `<div class="card narrow"><h1>Sign in</h1>
+    `<div class="card narrow"><h1>Sign in to mcp-imap</h1>${signInContext(opts.host, opts.clientName)}
 <form method="post" action="/login">
 <input type="hidden" name="csrf" value="${esc(opts.csrf)}"><input type="hidden" name="next" value="${esc(opts.next)}">
-<label for="username">Username</label><input id="username" type="text" name="username" autocomplete="username" required autofocus value="${esc(opts.username)}">
+<label for="username">Username</label><input id="username" type="text" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus value="${esc(opts.username)}">
 <label for="password">Password</label><input id="password" type="password" name="password" autocomplete="current-password" required>
 <div class="actions"><button type="submit">Sign in</button></div></form>
 ${
@@ -82,10 +90,10 @@ ${
   );
 }
 
-export function registerPage(opts: PageOptions & { next: string; username?: string }): string {
+export function registerPage(opts: PageOptions & { next: string; username?: string; host: string; clientName?: string }): string {
   return page(
     opts,
-    `<div class="card narrow"><h1>Create account</h1>
+    `<div class="card narrow"><h1>Create an mcp-imap account</h1>${signInContext(opts.host, opts.clientName)}
 <form method="post" action="/register">
 <input type="hidden" name="csrf" value="${esc(opts.csrf)}"><input type="hidden" name="next" value="${esc(opts.next)}">
 <label for="username">Username</label><input id="username" type="text" name="username" autocomplete="username" required value="${esc(opts.username)}">

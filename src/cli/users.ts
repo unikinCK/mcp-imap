@@ -1,6 +1,6 @@
 import { createInterface } from 'node:readline';
 import { ConfigError } from '../config.js';
-import { Store } from '../http/store.js';
+import { MIN_PASSWORD_LENGTH, Store } from '../http/store.js';
 
 /** Reads a password from the terminal without echoing it, or the first line of stdin when piped. */
 async function readPassword(prompt: string): Promise<string> {
@@ -31,12 +31,18 @@ async function readPassword(prompt: string): Promise<string> {
 }
 
 async function newPassword(): Promise<string> {
-  const password = await readPassword('Password: ');
-  if (process.stdin.isTTY) {
+  if (!process.stdin.isTTY) return readPassword('');
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const password = await readPassword(`Password (min. ${MIN_PASSWORD_LENGTH} characters, input is hidden): `);
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      process.stderr.write(`Too short (${password.length} characters). Please use at least ${MIN_PASSWORD_LENGTH}.\n`);
+      continue;
+    }
     const repeat = await readPassword('Repeat password: ');
-    if (password !== repeat) throw new ConfigError('Passwords do not match.');
+    if (password === repeat) return password;
+    process.stderr.write('Passwords do not match. Please try again.\n');
   }
-  return password;
+  throw new ConfigError('No valid password entered.');
 }
 
 export async function userCommand(args: string[], env: NodeJS.ProcessEnv = process.env): Promise<void> {

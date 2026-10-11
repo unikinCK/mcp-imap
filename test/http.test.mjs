@@ -203,7 +203,9 @@ describe('http server', () => {
     const loginUrl = new URL(res.headers.get('location'), base);
     assert.equal(loginUrl.pathname, '/login');
 
-    await browser.request(loginUrl.pathname + loginUrl.search);
+    const loginHtml = await (await browser.request(loginUrl.pathname + loginUrl.search)).text();
+    assert.match(loginHtml, new RegExp(`<code>localhost:${port}</code>`), 'login page shows the server');
+    assert.match(loginHtml, /connect <strong>Test Client<\/strong>/, 'login page shows the requesting app');
     res = await browser.request('/login', {
       method: 'POST',
       form: { csrf: browser.csrf(), username: 'alice', password: PASSWORD, next: loginUrl.searchParams.get('next') },

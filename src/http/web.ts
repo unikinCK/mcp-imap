@@ -180,6 +180,16 @@ export function webRouter({ store, config, onUserChanged }: WebOptions): Router 
 
   const render = (res: Response, html: string, status = 200) => res.status(status).type('html').send(html);
 
+  /** Where the user signs in: server host and, during an OAuth flow, the requesting application. */
+  const signInContext = (next: string) => {
+    let clientName: string | undefined;
+    const url = new URL(next, config.publicUrl);
+    const requestId = url.pathname === '/oauth/consent' ? url.searchParams.get('request') : null;
+    const request = requestId ? store.getAuthRequest(requestId) : undefined;
+    if (request) clientName = store.getClient(request.clientId)?.client_name || request.clientId;
+    return { host: config.publicUrl.host, clientName };
+  };
+
   const forbidden = (req: Request, res: Response) =>
     render(res, messagePage({ title: 'Error', csrf: csrfToken(req, res), heading: 'Request rejected', text: 'Invalid or missing form token. Please go back, reload the page and try again.' }), 403);
 
@@ -209,7 +219,7 @@ export function webRouter({ store, config, onUserChanged }: WebOptions): Router 
   router.get('/login', (req, res) => {
     const next = safeNext(req.query.next);
     if (currentUser(req)) return res.redirect(303, next);
-    render(res, loginPage({ title: 'Sign in', csrf: csrfToken(req, res), next, allowRegistration: config.allowRegistration }));
+    render(res, loginPage({ title: 'Sign in', csrf: csrfToken(req, res), next, allowRegistration: config.allowRegistration, ...signInContext(next) }));
   });
 
   router.post('/login', loginLimiter, async (req, res) => {
@@ -220,7 +230,7 @@ export function webRouter({ store, config, onUserChanged }: WebOptions): Router 
     if (!user) {
       return render(
         res,
-        loginPage({ title: 'Sign in', csrf: csrfToken(req, res), next, username, allowRegistration: config.allowRegistration, error: 'Invalid username or password.' }),
+        loginPage({ title: 'Sign in', csrf: csrfToken(req, res), next, username, allowRegistration: config.allowRegistration, error: 'Invalid username or password.', ...signInContext(next) }),
         401,
       );
     }
@@ -240,7 +250,8 @@ export function webRouter({ store, config, onUserChanged }: WebOptions): Router 
 
   router.get('/register', (req, res) => {
     if (!config.allowRegistration) return res.redirect(303, '/login');
-    render(res, registerPage({ title: 'Create account', csrf: csrfToken(req, res), next: safeNext(req.query.next) }));
+    const next = safeNext(req.query.next);
+    render(res, registerPage({ title: 'Create account', csrf: csrfToken(req, res), next, ...signInContext(next) }));
   });
 
   router.post('/register', loginLimiter, async (req, res) => {
@@ -255,7 +266,7 @@ export function webRouter({ store, config, onUserChanged }: WebOptions): Router 
       setCookie(res, SESSION_COOKIE, store.createSession(user.id, SESSION_TTL), SESSION_TTL);
       res.redirect(303, next);
     } catch (err) {
-      render(res, registerPage({ title: 'Create account', csrf: csrfToken(req, res), next, username, error: (err as Error).message }), 400);
+      render(res, registerPage({ title: 'Create account', csrf: csrfToken(req, res), next, username, error: (err as Error).message, ...signInContext(next) }), 400);
     }
   });
 
