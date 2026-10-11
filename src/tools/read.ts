@@ -35,11 +35,13 @@ export function registerReadTools(server: McpServer, accounts: AccountManager, c
     handler(async () =>
       json({
         mode: config.mode,
+        auditLogFolder: config.mode === 'read-write' ? config.logFolder : undefined,
         accounts: accounts.list().map((a) => ({
           name: a.name,
           user: a.imap.user,
           host: a.imap.host,
           writable: accounts.isWritable(a.name),
+          canDelete: accounts.isWritable(a.name) && config.allowDelete,
           canSend: accounts.isWritable(a.name) && config.allowSend && Boolean(a.smtp),
         })),
       }),

@@ -9,7 +9,7 @@ import type { ServerConfig } from '../config.js';
 import { ConnectionPool } from '../imap.js';
 import { createServer } from '../server.js';
 import type { HttpConfig } from './config.js';
-import { ImapOAuthProvider, SCOPES, supportedScopes } from './oauth.js';
+import { grantableScopes, ImapOAuthProvider, permissions, SCOPES } from './oauth.js';
 import { Store } from './store.js';
 import { webRouter } from './web.js';
 
@@ -65,7 +65,7 @@ export function createHttpApp(config: HttpConfig, store = new Store(config.dbPat
       issuerUrl: config.publicUrl,
       baseUrl: config.publicUrl,
       resourceServerUrl: mcpUrl,
-      scopesSupported: supportedScopes(config),
+      scopesSupported: grantableScopes(config),
       resourceName: 'mcp-imap',
     }),
   );
@@ -89,10 +89,16 @@ export function createHttpApp(config: HttpConfig, store = new Store(config.dbPat
     const userId = Number(auth.extra?.userId);
     let server: ReturnType<typeof createServer>['server'] | undefined;
     try {
-      const canWrite = config.mode === 'read-write' && auth.scopes.includes(SCOPES.write);
+      const granted = permissions(auth.scopes);
+      const canWrite = config.mode === 'read-write' && granted.organize;
+      const client = store.getClient(auth.clientId);
+      const user = store.getUser(userId);
       const serverConfig: ServerConfig = {
         mode: canWrite ? 'read-write' : 'read-only',
-        allowSend: canWrite && config.allowSend && auth.scopes.includes(SCOPES.send),
+        allowSend: canWrite && config.allowSend && granted.send,
+        allowDelete: canWrite && config.allowDelete && granted.delete,
+        logFolder: config.logFolder,
+        actor: `${client?.client_name || auth.clientId} (mcp-imap user ${user?.username ?? userId}, scopes: ${auth.scopes.join(' ')})`,
         accounts: store.accountConfigs(userId),
         maxBodyChars: config.maxBodyChars,
         maxAttachmentBytes: config.maxAttachmentBytes,

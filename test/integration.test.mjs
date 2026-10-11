@@ -177,6 +177,40 @@ describe('integration', { skip: !host && 'IMAP_TEST_HOST not set' }, () => {
       assert.equal((await callJson(client, 'list_messages', { mailbox: 'Trash' })).total, 0);
     });
 
+    test('records every change in the "MCP Log" folder and protects it', async () => {
+      const log = await callJson(client, 'list_messages', { mailbox: 'MCP Log', limit: 100 });
+      const subjects = log.messages.map((m) => m.subject);
+      for (const expected of [
+        '[mcp-imap] Created folder Archive',
+        '[mcp-imap] Renamed folder Temp -> Temp2',
+        '[mcp-imap] Deleted folder Temp2 with 0 message(s)',
+        '[mcp-imap] Flags +\\Seen +\\Flagged on 1 message(s) in INBOX',
+        '[mcp-imap] Copied 1 message(s) INBOX -> Archive',
+        '[mcp-imap] Moved 1 message(s) INBOX -> Archive',
+        '[mcp-imap] Deleted 1 message(s) from Archive (moved to Trash)',
+        '[mcp-imap] Permanently deleted 1 message(s) from Trash',
+      ]) {
+        assert.ok(subjects.includes(expected), `missing log entry "${expected}" in:\n${subjects.join('\n')}`);
+      }
+      const moved = log.messages.find((m) => m.subject === '[mcp-imap] Moved 1 message(s) INBOX -> Archive');
+      const entry = await callJson(client, 'get_message', { mailbox: 'MCP Log', uid: moved.uid });
+      assert.match(entry.body.text, /Action:  move_messages/);
+      assert.match(entry.body.text, /Actor:   local stdio client/);
+      assert.match(entry.body.text, /Alice <alice@example\.com> \| Plain hello/);
+
+      for (const [name, args] of [
+        ['delete_mailbox', { path: 'MCP Log' }],
+        ['rename_mailbox', { path: 'MCP Log', new_path: 'Other' }],
+        ['delete_messages', { mailbox: 'MCP Log', uids: [moved.uid], permanent: true }],
+        ['move_messages', { mailbox: 'MCP Log', uids: [moved.uid], destination: 'Archive' }],
+        ['update_flags', { mailbox: 'MCP Log', uids: [moved.uid], remove: ['seen'] }],
+      ]) {
+        const result = await client.callTool({ name, arguments: args });
+        assert.ok(result.isError, `${name} on the log folder must fail`);
+        assert.match(result.content[0].text, /audit log folder/);
+      }
+    });
+
     test('saves a threaded reply draft', async () => {
       const { messages } = await callJson(client, 'search_messages', { subject: 'Question' });
       const draft = await callJson(client, 'save_draft', {
@@ -205,6 +239,45 @@ describe('integration', { skip: !host && 'IMAP_TEST_HOST not set' }, () => {
       assert.equal(inbox.totalMatches, 1);
       const answered = await callJson(client, 'search_messages', { answered: true });
       assert.equal(answered.messages[0].uid, messages[0].uid);
+    });
+  });
+
+  describe('organize mode: read-write without delete and send', () => {
+    let client;
+    before(async () => (client = await startClient(['--read-write', '--no-delete', '--no-send'])));
+    after(async () => client?.close());
+
+    test('exposes no delete or send tools', async () => {
+      const names = (await client.listTools()).tools.map((t) => t.name);
+      for (const t of ['update_flags', 'move_messages', 'copy_messages', 'create_mailbox', 'rename_mailbox', 'save_draft']) {
+        assert.ok(names.includes(t), `${t} must be exposed`);
+      }
+      for (const t of ['delete_messages', 'delete_mailbox', 'send_email']) {
+        assert.ok(!names.includes(t), `${t} must not be exposed`);
+      }
+      const info = await callJson(client, 'list_accounts', {});
+      assert.equal(info.accounts[0].canDelete, false);
+      assert.equal(info.accounts[0].canSend, false);
+    });
+
+    test('moves as verified copy, but never to Trash', async () => {
+      const { messages } = await callJson(client, 'search_messages', { subject: 'Report with attachment' });
+      const uid = messages[0].uid;
+      const moved = await callJson(client, 'move_messages', { uids: [uid], destination: 'Archive' });
+      assert.deepEqual(moved.moved, [uid]);
+      assert.equal(moved.unverified, undefined);
+      assert.equal((await callJson(client, 'search_messages', { subject: 'Report with attachment' })).totalMatches, 0);
+      const archived = await callJson(client, 'search_messages', { mailbox: 'Archive', subject: 'Report with attachment' });
+      assert.equal(archived.totalMatches, 1);
+      assert.equal(archived.messages[0].uid, Number(moved.uidMap[uid]));
+
+      const toTrash = await client.callTool({
+        name: 'move_messages',
+        arguments: { mailbox: 'Archive', uids: [archived.messages[0].uid], destination: 'Trash' },
+      });
+      assert.ok(toTrash.isError);
+      assert.match(toTrash.content[0].text, /counts as deleting/);
+      assert.equal((await callJson(client, 'search_messages', { mailbox: 'Archive', subject: 'Report with attachment' })).totalMatches, 1);
     });
   });
 });

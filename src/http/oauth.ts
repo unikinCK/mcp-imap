@@ -13,20 +13,54 @@ import type { Store } from './store.js';
 
 export const SCOPES = {
   read: 'mail:read',
-  write: 'mail:write',
+  organize: 'mail:organize',
+  delete: 'mail:delete',
   send: 'mail:send',
+  /** Legacy (v0.2.0): organize + delete. Still accepted, no longer offered on the consent screen. */
+  write: 'mail:write',
 } as const;
 
 export const SCOPE_DESCRIPTIONS: Record<string, string> = {
   [SCOPES.read]: 'Read mailboxes, messages and attachments',
-  [SCOPES.write]: 'Change messages and folders: flag, move, delete, save drafts',
+  [SCOPES.organize]:
+    'Organize without deleting: flag, copy and move messages (moves are verified before the original is removed), ' +
+    'create and rename folders, save drafts',
+  [SCOPES.delete]: 'Delete messages and folders',
   [SCOPES.send]: 'Send emails in your name',
 };
 
-/** Scopes the server can grant in its current mode. */
-export function supportedScopes(config: HttpConfig): string[] {
+/** Scopes shown on the consent screen, limited by the server mode. */
+export function grantableScopes(config: HttpConfig): string[] {
   if (config.mode === 'read-only') return [SCOPES.read];
-  return config.allowSend ? [SCOPES.read, SCOPES.write, SCOPES.send] : [SCOPES.read, SCOPES.write];
+  const scopes: string[] = [SCOPES.read, SCOPES.organize];
+  if (config.allowDelete) scopes.push(SCOPES.delete);
+  if (config.allowSend) scopes.push(SCOPES.send);
+  return scopes;
+}
+
+/** Scopes a client may request (grantable ones plus the legacy write scope). */
+export function supportedScopes(config: HttpConfig): string[] {
+  const scopes = grantableScopes(config);
+  return config.mode === 'read-write' ? [...scopes, SCOPES.write] : scopes;
+}
+
+/** Expands legacy scopes and implications: delete and send both need organize. */
+export function normalizeScopes(scopes: string[]): string[] {
+  const set = new Set<string>([SCOPES.read, ...scopes]);
+  if (set.has(SCOPES.write)) {
+    set.delete(SCOPES.write);
+    set.add(SCOPES.organize);
+    set.add(SCOPES.delete);
+  }
+  if (set.has(SCOPES.delete) || set.has(SCOPES.send)) set.add(SCOPES.organize);
+  const order: string[] = [SCOPES.read, SCOPES.organize, SCOPES.delete, SCOPES.send];
+  return order.filter((s) => set.has(s));
+}
+
+/** Permissions of a token, taking legacy scopes into account. */
+export function permissions(scopes: string[]) {
+  const s = normalizeScopes(scopes);
+  return { organize: s.includes(SCOPES.organize), delete: s.includes(SCOPES.delete), send: s.includes(SCOPES.send) };
 }
 
 function sameUrl(a: string, b: string): boolean {

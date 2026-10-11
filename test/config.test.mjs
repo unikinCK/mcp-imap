@@ -47,6 +47,15 @@ test('SMTP inherits IMAP credentials', () => {
   assert.equal(smtp.saveToSent, true);
 });
 
+test('--no-delete disables deleting, audit log folder is configurable', () => {
+  assert.equal(loadConfig(['--read-write'], baseEnv).allowDelete, true);
+  assert.equal(loadConfig(['--read-write', '--no-delete'], baseEnv).allowDelete, false);
+  assert.equal(loadConfig([], { ...baseEnv, MCP_IMAP_ALLOW_DELETE: 'false' }).allowDelete, false);
+  assert.equal(loadConfig([], baseEnv).logFolder, 'MCP Log');
+  assert.equal(loadConfig([], { ...baseEnv, MCP_IMAP_LOG_FOLDER: 'Audit' }).logFolder, 'Audit');
+  assert.equal(loadConfig([], { ...baseEnv, MCP_IMAP_LOG_FOLDER: 'off' }).logFolder, undefined);
+});
+
 test('--no-send disables sending', () => {
   assert.equal(loadConfig(['--read-write'], baseEnv).allowSend, true);
   assert.equal(loadConfig(['--read-write', '--no-send'], baseEnv).allowSend, false);

@@ -176,7 +176,7 @@ describe('http server', () => {
     const as = await (await fetch(`${base}/.well-known/oauth-authorization-server`)).json();
     assert.equal(as.registration_endpoint, `${base}/register`);
     assert.deepEqual(as.code_challenge_methods_supported, ['S256']);
-    assert.deepEqual(as.scopes_supported, ['mail:read', 'mail:write', 'mail:send']);
+    assert.deepEqual(as.scopes_supported, ['mail:read', 'mail:organize', 'mail:delete', 'mail:send']);
   });
 
   test('login rejects wrong password and missing CSRF token', async () => {
@@ -233,7 +233,7 @@ describe('http server', () => {
     assert.doesNotMatch(page, /secret/, 'passwords must never be rendered');
   });
 
-  test('read-only grant exposes only read tools; write grant exposes write tools', async () => {
+  test('scopes control the exposed tools: read, organize, organize+send, full', async () => {
     const readTokens = await authorize(browser, client, []);
     assert.equal(readTokens.scope, 'mail:read');
     const readClient = await mcpClient(readTokens.access_token);
@@ -242,12 +242,36 @@ describe('http server', () => {
     assert.ok(!readTools.includes('move_messages'));
     await readClient.close();
 
-    const writeTokens = await authorize(browser, client, ['mail:write', 'mail:send']);
-    assert.equal(writeTokens.scope, 'mail:read mail:write mail:send');
-    const writeClient = await mcpClient(writeTokens.access_token);
-    const writeTools = (await writeClient.listTools()).tools.map((t) => t.name);
-    assert.ok(writeTools.includes('move_messages') && writeTools.includes('send_email'));
-    await writeClient.close();
+    const toolsFor = async (scopes) => {
+      const tokens = await authorize(browser, client, scopes);
+      const mcp = await mcpClient(tokens.access_token);
+      const names = (await mcp.listTools()).tools.map((t) => t.name);
+      await mcp.close();
+      return { scope: tokens.scope, names };
+    };
+
+    // Organize without delete and without send
+    const organize = await toolsFor(['mail:organize']);
+    assert.equal(organize.scope, 'mail:read mail:organize');
+    assert.ok(organize.names.includes('move_messages') && organize.names.includes('save_draft'));
+    assert.ok(!organize.names.includes('delete_messages') && !organize.names.includes('delete_mailbox'));
+    assert.ok(!organize.names.includes('send_email'));
+
+    // Organize with send, still no delete
+    const organizeSend = await toolsFor(['mail:organize', 'mail:send']);
+    assert.equal(organizeSend.scope, 'mail:read mail:organize mail:send');
+    assert.ok(organizeSend.names.includes('send_email') && !organizeSend.names.includes('delete_messages'));
+
+    // Send or delete imply organize
+    assert.equal((await toolsFor(['mail:send'])).scope, 'mail:read mail:organize mail:send');
+
+    // Full access
+    const full = await toolsFor(['mail:organize', 'mail:delete', 'mail:send']);
+    assert.equal(full.scope, 'mail:read mail:organize mail:delete mail:send');
+    assert.ok(full.names.includes('delete_messages') && full.names.includes('send_email'));
+
+    // Legacy scope from v0.2.0 maps to organize + delete
+    assert.equal((await toolsFor(['mail:write'])).scope, 'mail:read mail:organize mail:delete');
   });
 
   test('works with a real mailbox', { skip: !imapHost && 'IMAP_TEST_HOST not set' }, async () => {
@@ -256,7 +280,7 @@ describe('http server', () => {
     transport.close();
     await new Promise((r) => setTimeout(r, 300));
 
-    const tokens = await authorize(browser, client, ['mail:write']);
+    const tokens = await authorize(browser, client, ['mail:organize']);
     const mcp = await mcpClient(tokens.access_token);
     const result = await mcp.callTool({ name: 'list_messages', arguments: {} });
     assert.ok(!result.isError, result.content[0].text);

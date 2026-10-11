@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import type { ImapFlow } from 'imapflow';
+import type { FetchMessageObject, ImapFlow } from 'imapflow';
 import nodemailer from 'nodemailer';
 import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 import type Mail from 'nodemailer/lib/mailer/index.js';
 import { z } from 'zod';
 import type { AccountConfig, ServerConfig } from '../config.js';
+import { AuditLog, describeMessages } from '../audit.js';
 import { type AccountManager, findSpecialUse, ToolError } from '../imap.js';
 import { formatAddresses, parseHeaders } from '../messages.js';
 import { accountArg, handler, json, mailboxArg, uidsArg } from './common.js';
@@ -141,20 +142,95 @@ async function buildMessage(account: AccountConfig, args: ComposeArgs, reply?: R
   }
   const mail = new MailComposer(options).compile();
   const raw = await mail.build();
-  return { raw, envelope: mail.getEnvelope(), messageId: options.messageId as string };
+  return { raw, envelope: mail.getEnvelope(), messageId: options.messageId as string, subject: options.subject as string };
 }
 
 const WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } as const;
 const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true } as const;
 
+interface MoveResult {
+  destination: string;
+  uidMap: Record<number, number>;
+  moved: number[];
+  /** Copied, but the copy could not be verified, so the original was kept. */
+  unverified: number[];
+  notFound: number[];
+}
+
+/**
+ * Moves messages as a verified copy: COPY, check that every copy exists in the destination with
+ * the same size and Message-ID, and only then remove exactly those originals (UID EXPUNGE).
+ * Originals whose copy cannot be verified are kept.
+ */
+async function verifiedMove(client: ImapFlow, from: string, uids: number[], to: string): Promise<MoveResult> {
+  if (!client.capabilities.has('UIDPLUS')) {
+    throw new ToolError('The server does not support UIDPLUS, so moves cannot be verified. Nothing was changed.');
+  }
+  let lock = await client.getMailboxLock(from);
+  let source: FetchMessageObject[];
+  let copy;
+  try {
+    source = await client.fetchAll(uids.join(','), { uid: true, size: true, envelope: true }, { uid: true });
+    if (!source.length) throw new ToolError(`None of the given messages exist in "${from}".`);
+    copy = await client.messageCopy(source.map((m) => m.uid).join(','), to, { uid: true });
+  } finally {
+    lock.release();
+  }
+  if (!copy) throw new ToolError('Copy failed. Nothing was changed.');
+  const uidMap = copy.uidMap ?? new Map<number, number>();
+  const destination = copy.destination ?? to;
+
+  lock = await client.getMailboxLock(destination, { readOnly: true });
+  let copies: FetchMessageObject[] = [];
+  try {
+    const newUids = [...uidMap.values()];
+    if (newUids.length) copies = await client.fetchAll(newUids.join(','), { uid: true, size: true, envelope: true }, { uid: true });
+  } finally {
+    lock.release();
+  }
+  const byUid = new Map(copies.map((m) => [m.uid, m]));
+  const verified: number[] = [];
+  const unverified: number[] = [];
+  for (const original of source) {
+    const target = uidMap.has(original.uid) ? byUid.get(uidMap.get(original.uid)!) : undefined;
+    const same =
+      target !== undefined &&
+      target.size === original.size &&
+      (target.envelope?.messageId ?? '') === (original.envelope?.messageId ?? '');
+    (same ? verified : unverified).push(original.uid);
+  }
+
+  if (verified.length) {
+    lock = await client.getMailboxLock(from);
+    try {
+      if (!(await client.messageDelete(verified.join(','), { uid: true }))) {
+        throw new ToolError(`Messages were copied to "${destination}", but removing the originals from "${from}" failed.`);
+      }
+    } finally {
+      lock.release();
+    }
+  }
+  const found = new Set(source.map((m) => m.uid));
+  return {
+    destination,
+    uidMap: Object.fromEntries([...uidMap].filter(([src]) => verified.includes(src))),
+    moved: verified,
+    unverified,
+    notFound: uids.filter((uid) => !found.has(uid)),
+  };
+}
+
 export function registerWriteTools(server: McpServer, accounts: AccountManager, config: ServerConfig): void {
+  const audit = new AuditLog(config.logFolder, config.actor ?? 'unknown client');
+  const logNote = audit.enabled ? ` Every change is recorded in the "${audit.folder}" folder.` : '';
+
   server.registerTool(
     'update_flags',
     {
       title: 'Update message flags',
       description:
         'Adds and/or removes flags on messages, e.g. mark as read (add "seen"), unread (remove "seen"), ' +
-        'flag/star (add "flagged") or set custom keywords.',
+        'flag/star (add "flagged") or set custom keywords.' + logNote,
       inputSchema: {
         account: accountArg,
         mailbox: mailboxArg,
@@ -168,12 +244,21 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
       const addFlags = (add ?? []).map(toImapFlag);
       const removeFlags = (remove ?? []).map(toImapFlag);
       if (!addFlags.length && !removeFlags.length) throw new ToolError('Nothing to do: provide add and/or remove.');
-      return accounts.withMailbox(account, mailbox, true, async (client) => {
+      return accounts.withMailbox(account, mailbox, true, async (client, acc) => {
+        audit.assertNotLogFolder(client, mailbox);
         const range = uids.join(',');
+        const messages = await describeMessages(client, uids);
         if (addFlags.length) await client.messageFlagsAdd(range, addFlags, { uid: true });
         if (removeFlags.length) await client.messageFlagsRemove(range, removeFlags, { uid: true });
         const after = await client.fetchAll(range, { uid: true, flags: true }, { uid: true });
-        return json({ mailbox, updated: after.map((m) => ({ uid: m.uid, flags: [...(m.flags ?? [])] })) });
+        const change = [...addFlags.map((f) => `+${f}`), ...removeFlags.map((f) => `-${f}`)].join(' ');
+        const log = await audit.write(client, acc, {
+          action: 'update_flags',
+          summary: `Flags ${change} on ${messages.length} message(s) in ${mailbox}`,
+          mailbox,
+          messages,
+        });
+        return json({ mailbox, updated: after.map((m) => ({ uid: m.uid, flags: [...(m.flags ?? [])] })), ...log });
       });
     }),
   );
@@ -182,84 +267,104 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
     'move_messages',
     {
       title: 'Move messages',
-      description: 'Moves messages to another mailbox. Returns the new UIDs in the destination if the server reports them.',
+      description:
+        'Moves messages to another mailbox as a verified copy: the messages are copied, each copy is checked in the ' +
+        'destination, and only then the originals are removed. Originals whose copy cannot be verified are kept.' +
+        (config.allowDelete ? '' : ' Moving to Trash is not allowed (no delete permission).') +
+        logNote,
       inputSchema: { account: accountArg, mailbox: mailboxArg, uids: uidsArg, destination: z.string() },
       annotations: { ...WRITE, idempotentHint: false },
     },
-    handler(async ({ account, mailbox, uids, destination }) =>
-      accounts.withMailbox(account, mailbox, true, async (client) => {
-        if (destination === mailbox) throw new ToolError('Source and destination are the same mailbox.');
-        const result = await client.messageMove(uids.join(','), destination, { uid: true });
-        if (!result) throw new ToolError('Move failed.');
-        return json({ from: mailbox, to: result.destination, uidMap: result.uidMap ? Object.fromEntries(result.uidMap) : undefined });
-      }),
-    ),
+    handler(async ({ account, mailbox, uids, destination }) => {
+      accounts.assertWritable(account);
+      if (destination === mailbox) throw new ToolError('Source and destination are the same mailbox.');
+      return accounts.withClient(account, async (client, acc) => {
+        audit.assertNotLogFolder(client, mailbox, destination);
+        if (!config.allowDelete) {
+          const trash = await findSpecialUse(client, '\\Trash');
+          if (trash && trash.path.toLowerCase() === destination.toLowerCase()) {
+            throw new ToolError('Moving messages to Trash counts as deleting, which is not permitted.');
+          }
+        }
+        const lock = await client.getMailboxLock(mailbox, { readOnly: true });
+        let messages;
+        try {
+          messages = await describeMessages(client, uids);
+        } finally {
+          lock.release();
+        }
+        const result = await verifiedMove(client, mailbox, uids, destination);
+        const log = await audit.write(client, acc, {
+          action: 'move_messages',
+          summary: `Moved ${result.moved.length} message(s) ${mailbox} -> ${result.destination}`,
+          mailbox,
+          messages: messages.filter((m) => result.moved.includes(m.uid)),
+          details: {
+            destination: result.destination,
+            newUids: result.uidMap,
+            ...(result.unverified.length ? { notVerifiedKeptOriginals: result.unverified } : {}),
+          },
+        });
+        return json({
+          from: mailbox,
+          to: result.destination,
+          moved: result.moved,
+          uidMap: result.uidMap,
+          ...(result.unverified.length
+            ? {
+                unverified: result.unverified,
+                warning: 'These messages were copied but the copy could not be verified; the originals were kept.',
+              }
+            : {}),
+          ...(result.notFound.length ? { notFound: result.notFound } : {}),
+          ...log,
+        });
+      });
+    }),
   );
 
   server.registerTool(
     'copy_messages',
     {
       title: 'Copy messages',
-      description: 'Copies messages to another mailbox.',
+      description: 'Copies messages to another mailbox.' + logNote,
       inputSchema: { account: accountArg, mailbox: mailboxArg, uids: uidsArg, destination: z.string() },
       annotations: { ...WRITE, idempotentHint: false },
     },
     handler(async ({ account, mailbox, uids, destination }) =>
-      accounts.withMailbox(account, mailbox, true, async (client) => {
+      accounts.withMailbox(account, mailbox, true, async (client, acc) => {
+        audit.assertNotLogFolder(client, mailbox, destination);
+        const messages = await describeMessages(client, uids);
         const result = await client.messageCopy(uids.join(','), destination, { uid: true });
         if (!result) throw new ToolError('Copy failed.');
-        return json({ from: mailbox, to: result.destination, uidMap: result.uidMap ? Object.fromEntries(result.uidMap) : undefined });
+        const uidMap = result.uidMap ? Object.fromEntries(result.uidMap) : undefined;
+        const log = await audit.write(client, acc, {
+          action: 'copy_messages',
+          summary: `Copied ${messages.length} message(s) ${mailbox} -> ${result.destination}`,
+          mailbox,
+          messages,
+          details: { destination: result.destination, newUids: uidMap },
+        });
+        return json({ from: mailbox, to: result.destination, uidMap, ...log });
       }),
     ),
-  );
-
-  server.registerTool(
-    'delete_messages',
-    {
-      title: 'Delete messages',
-      description:
-        'Deletes messages. By default they are moved to the Trash mailbox. With permanent=true (or when already in Trash) ' +
-        'they are flagged \\Deleted and expunged, which cannot be undone.',
-      inputSchema: {
-        account: accountArg,
-        mailbox: mailboxArg,
-        uids: uidsArg,
-        permanent: z.boolean().default(false),
-      },
-      annotations: DESTRUCTIVE,
-    },
-    handler(async ({ account, mailbox, uids, permanent }) => {
-      accounts.assertWritable(account);
-      const trash = permanent ? undefined : await accounts.withClient(account, (client) => findSpecialUse(client, '\\Trash'));
-      if (!permanent && !trash) {
-        throw new ToolError('No Trash mailbox found. Use move_messages, or permanent=true to delete permanently.');
-      }
-      const toTrash = !permanent && trash && trash.path !== mailbox;
-      return accounts.withMailbox(account, mailbox, true, async (client) => {
-        const range = uids.join(',');
-        if (toTrash) {
-          const result = await client.messageMove(range, trash.path, { uid: true });
-          if (!result) throw new ToolError('Moving to Trash failed.');
-          return json({ mailbox, movedTo: trash.path, uids });
-        }
-        const ok = await client.messageDelete(range, { uid: true });
-        if (!ok) throw new ToolError('Delete failed.');
-        return json({ mailbox, permanentlyDeleted: uids });
-      });
-    }),
   );
 
   server.registerTool(
     'create_mailbox',
     {
       title: 'Create mailbox',
-      description: 'Creates a new mailbox (folder). Use the server delimiter (see list_mailboxes) for nested folders.',
+      description: 'Creates a new mailbox (folder). Use the server delimiter (see list_mailboxes) for nested folders.' + logNote,
       inputSchema: { account: accountArg, path: z.string().min(1) },
       annotations: { ...WRITE, idempotentHint: false },
     },
     handler(async ({ account, path }) => {
       accounts.assertWritable(account);
-      return accounts.withClient(account, async (client) => json(await client.mailboxCreate(path)));
+      return accounts.withClient(account, async (client, acc) => {
+        const result = await client.mailboxCreate(path);
+        const log = await audit.write(client, acc, { action: 'create_mailbox', summary: `Created folder ${result.path}` });
+        return json({ ...result, ...log });
+      });
     }),
   );
 
@@ -267,29 +372,22 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
     'rename_mailbox',
     {
       title: 'Rename mailbox',
-      description: 'Renames or moves a mailbox (folder).',
+      description: 'Renames or moves a mailbox (folder).' + logNote,
       inputSchema: { account: accountArg, path: z.string().min(1), new_path: z.string().min(1) },
       annotations: { ...WRITE, idempotentHint: false },
     },
     handler(async ({ account, path, new_path }) => {
       accounts.assertWritable(account);
       if (path.toUpperCase() === 'INBOX') throw new ToolError('INBOX cannot be renamed.');
-      return accounts.withClient(account, async (client) => json(await client.mailboxRename(path, new_path)));
-    }),
-  );
-
-  server.registerTool(
-    'delete_mailbox',
-    {
-      title: 'Delete mailbox',
-      description: 'Deletes a mailbox (folder) and all messages in it. This cannot be undone.',
-      inputSchema: { account: accountArg, path: z.string().min(1) },
-      annotations: DESTRUCTIVE,
-    },
-    handler(async ({ account, path }) => {
-      accounts.assertWritable(account);
-      if (path.toUpperCase() === 'INBOX') throw new ToolError('INBOX cannot be deleted.');
-      return accounts.withClient(account, async (client) => json(await client.mailboxDelete(path)));
+      return accounts.withClient(account, async (client, acc) => {
+        audit.assertNotLogFolder(client, path, new_path);
+        const result = await client.mailboxRename(path, new_path);
+        const log = await audit.write(client, acc, {
+          action: 'rename_mailbox',
+          summary: `Renamed folder ${result.path} -> ${result.newPath}`,
+        });
+        return json({ ...result, ...log });
+      });
     }),
   );
 
@@ -299,7 +397,7 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
       title: 'Save draft',
       description:
         'Composes a message and stores it in the Drafts mailbox without sending it. ' +
-        'Use reply_to_message to create a threaded reply.',
+        'Use reply_to_message to create a threaded reply.' + logNote,
       inputSchema: {
         ...composeSchema,
         drafts_mailbox: z.string().optional().describe('Overrides the auto-detected Drafts mailbox.'),
@@ -309,16 +407,25 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
     handler(async (args) => {
       accounts.assertWritable(args.account);
       return accounts.withClient(args.account, async (client, account) => {
+        audit.assertNotLogFolder(client, args.drafts_mailbox);
         const reply = args.reply_to_message ? await loadReplyContext(client, args.reply_to_message) : undefined;
-        const { raw, messageId } = await buildMessage(account, args, reply);
+        const { raw, messageId, envelope, subject } = await buildMessage(account, args, reply);
         const drafts = args.drafts_mailbox ?? (await findSpecialUse(client, '\\Drafts'))?.path;
         if (!drafts) throw new ToolError('No Drafts mailbox found. Pass drafts_mailbox explicitly.');
         const result = await client.append(drafts, raw, ['\\Draft', '\\Seen']);
         if (!result) throw new ToolError('Saving the draft failed.');
-        return json({ savedTo: drafts, uid: result.uid, messageId });
+        const log = await audit.write(client, account, {
+          action: 'save_draft',
+          summary: `Draft saved: "${subject}"`,
+          mailbox: drafts,
+          details: { to: envelope.to, uid: result.uid, messageId, inReplyTo: reply?.messageId },
+        });
+        return json({ savedTo: drafts, uid: result.uid, messageId, ...log });
       });
     }),
   );
+
+  if (config.allowDelete) registerDeleteTools(server, accounts, audit, logNote);
 
   const canSendSomewhere = config.allowSend && accounts.list().some((a) => a.smtp && accounts.isWritable(a.name));
   if (!canSendSomewhere) return;
@@ -330,7 +437,7 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
       description:
         'Sends an email via the SMTP server configured for the account and (by default) stores a copy in the Sent mailbox. ' +
         'Use reply_to_message to send a threaded reply; the original is then flagged as answered. ' +
-        'Always confirm recipients and content with the user before sending.',
+        'Always confirm recipients and content with the user before sending.' + logNote,
       inputSchema: {
         ...composeSchema,
         save_to_sent: z.boolean().optional().describe('Store a copy in the Sent mailbox (default from account config).'),
@@ -346,7 +453,7 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
 
       return accounts.withClient(args.account, async (client) => {
         const reply = args.reply_to_message ? await loadReplyContext(client, args.reply_to_message) : undefined;
-        const { raw, envelope, messageId } = await buildMessage(account, args, reply);
+        const { raw, envelope, messageId, subject } = await buildMessage(account, args, reply);
         if (!envelope.to?.length) throw new ToolError('At least one recipient is required.');
 
         const transport = nodemailer.createTransport({
@@ -382,6 +489,19 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
             lock.release();
           }
         }
+        const log = await audit.write(client, account, {
+          action: 'send_email',
+          summary: `Sent: "${subject}" to ${envelope.to.join(', ')}`,
+          details: {
+            from: envelope.from,
+            recipients: envelope.to,
+            messageId,
+            inReplyTo: reply?.messageId,
+            accepted: info.accepted,
+            rejected: info.rejected,
+            savedTo,
+          },
+        });
         return json({
           messageId,
           accepted: info.accepted,
@@ -389,7 +509,92 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
           response: info.response,
           savedTo,
           ...(saveError ? { saveError } : {}),
+          ...log,
         });
+      });
+    }),
+  );
+}
+
+function registerDeleteTools(server: McpServer, accounts: AccountManager, audit: AuditLog, logNote: string): void {
+  server.registerTool(
+    'delete_messages',
+    {
+      title: 'Delete messages',
+      description:
+        'Deletes messages. By default they are moved to the Trash mailbox (verified move). With permanent=true (or when ' +
+        'already in Trash) they are flagged \\Deleted and expunged, which cannot be undone.' + logNote,
+      inputSchema: {
+        account: accountArg,
+        mailbox: mailboxArg,
+        uids: uidsArg,
+        permanent: z.boolean().default(false),
+      },
+      annotations: DESTRUCTIVE,
+    },
+    handler(async ({ account, mailbox, uids, permanent }) => {
+      accounts.assertWritable(account);
+      return accounts.withClient(account, async (client, acc) => {
+        audit.assertNotLogFolder(client, mailbox);
+        const trash = permanent ? undefined : await findSpecialUse(client, '\\Trash');
+        if (!permanent && !trash) {
+          throw new ToolError('No Trash mailbox found. Use move_messages, or permanent=true to delete permanently.');
+        }
+        const lock = await client.getMailboxLock(mailbox, { readOnly: true });
+        let messages;
+        try {
+          messages = await describeMessages(client, uids);
+        } finally {
+          lock.release();
+        }
+        if (trash && trash.path !== mailbox) {
+          const result = await verifiedMove(client, mailbox, uids, trash.path);
+          const log = await audit.write(client, acc, {
+            action: 'delete_messages',
+            summary: `Deleted ${result.moved.length} message(s) from ${mailbox} (moved to ${trash.path})`,
+            mailbox,
+            messages: messages.filter((m) => result.moved.includes(m.uid)),
+            details: { trash: trash.path, ...(result.unverified.length ? { notVerifiedKeptOriginals: result.unverified } : {}) },
+          });
+          return json({ mailbox, movedTo: trash.path, moved: result.moved, unverified: result.unverified, ...log });
+        }
+        const writeLock = await client.getMailboxLock(mailbox);
+        try {
+          if (!(await client.messageDelete(uids.join(','), { uid: true }))) throw new ToolError('Delete failed.');
+        } finally {
+          writeLock.release();
+        }
+        const log = await audit.write(client, acc, {
+          action: 'delete_messages',
+          summary: `Permanently deleted ${messages.length} message(s) from ${mailbox}`,
+          mailbox,
+          messages,
+        });
+        return json({ mailbox, permanentlyDeleted: messages.map((m) => m.uid), ...log });
+      });
+    }),
+  );
+
+  server.registerTool(
+    'delete_mailbox',
+    {
+      title: 'Delete mailbox',
+      description: 'Deletes a mailbox (folder) and all messages in it. This cannot be undone.' + logNote,
+      inputSchema: { account: accountArg, path: z.string().min(1) },
+      annotations: DESTRUCTIVE,
+    },
+    handler(async ({ account, path }) => {
+      accounts.assertWritable(account);
+      if (path.toUpperCase() === 'INBOX') throw new ToolError('INBOX cannot be deleted.');
+      return accounts.withClient(account, async (client, acc) => {
+        audit.assertNotLogFolder(client, path);
+        const status = await client.status(path, { messages: true }).catch(() => false as const);
+        const result = await client.mailboxDelete(path);
+        const log = await audit.write(client, acc, {
+          action: 'delete_mailbox',
+          summary: `Deleted folder ${result.path}${status ? ` with ${status.messages} message(s)` : ''}`,
+        });
+        return json({ ...result, ...log });
       });
     }),
   );

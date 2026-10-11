@@ -22,9 +22,12 @@ export function createServer(
       instructions: readOnly
         ? 'IMAP mailbox access in READ-ONLY mode. Messages can be listed, searched and read; nothing can be changed. ' +
           'Reading never marks messages as seen.'
-        : 'IMAP mailbox access in READ-WRITE mode. Besides reading, messages can be flagged, moved, copied and deleted, ' +
-          'mailboxes managed, drafts saved and (if configured) emails sent. Confirm destructive actions and outgoing ' +
-          'emails with the user first.',
+        : 'IMAP mailbox access in READ-WRITE mode. Besides reading, messages can be flagged, copied and moved ' +
+          '(verified copy), folders created and renamed and drafts saved' +
+          (config.allowDelete ? '; messages and folders can be deleted' : '; deleting is NOT permitted') +
+          (config.allowSend ? '; emails can be sent' : '') +
+          '. Confirm destructive actions and outgoing emails with the user first.' +
+          (config.logFolder ? ` Every change is recorded in the "${config.logFolder}" folder of the mailbox (read-only for you).` : ''),
     },
   );
   registerReadTools(server, accounts, config);

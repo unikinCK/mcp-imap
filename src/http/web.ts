@@ -4,7 +4,7 @@ import { ImapFlow } from 'imapflow';
 import nodemailer from 'nodemailer';
 import type { HttpConfig } from './config.js';
 import { randomToken, safeEqual } from './crypto.js';
-import { SCOPES, supportedScopes } from './oauth.js';
+import { grantableScopes, normalizeScopes } from './oauth.js';
 import type { MailAccountSettings, Store, User } from './store.js';
 import {
   accountPage,
@@ -290,8 +290,8 @@ export function webRouter({ store, config, onUserChanged }: WebOptions): Router 
         requestId,
         clientName: client?.client_name || request.clientId,
         redirectHost: new URL(request.redirectUri).host || request.redirectUri,
-        requested: request.scopes,
-        available: supportedScopes(config),
+        requested: normalizeScopes(request.scopes),
+        available: grantableScopes(config),
         accountCount: store.listMailAccounts(user.id).length,
       }),
     );
@@ -312,10 +312,9 @@ export function webRouter({ store, config, onUserChanged }: WebOptions): Router 
         target.searchParams.set('error_description', 'The user denied the request');
         return res.redirect(303, target.href);
       }
-      const available = supportedScopes(config);
-      const scopes = [...new Set([SCOPES.read, ...list(req.body?.scope)])].filter((s) => available.includes(s));
-      // Sending only makes sense together with write access.
-      if (scopes.includes(SCOPES.send) && !scopes.includes(SCOPES.write)) scopes.push(SCOPES.write);
+      const available = grantableScopes(config);
+      // Delete and send imply organize; anything not offered by the server is dropped.
+      const scopes = normalizeScopes(list(req.body?.scope)).filter((s) => available.includes(s));
       const code = store.createAuthCode({ ...request, scopes, userId: user.id });
       target.searchParams.set('code', code);
       res.redirect(303, target.href);

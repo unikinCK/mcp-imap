@@ -1,9 +1,11 @@
 import { readFileSync } from 'node:fs';
-import { ConfigError, type Mode } from '../config.js';
+import { type BaseConfig, ConfigError, type Mode } from '../config.js';
 
 export interface HttpConfig {
   mode: Mode;
   allowSend: boolean;
+  allowDelete: boolean;
+  logFolder?: string;
   publicUrl: URL;
   host: string;
   port: number;
@@ -34,7 +36,7 @@ function int(value: string | undefined, fallback: number, name: string): number 
 }
 
 export function loadHttpConfig(
-  base: { mode: Mode; allowSend: boolean; maxBodyChars: number; maxAttachmentBytes: number },
+  base: BaseConfig,
   env: NodeJS.ProcessEnv = process.env,
 ): HttpConfig {
   const port = int(env.MCP_IMAP_HTTP_PORT, 3000, 'MCP_IMAP_HTTP_PORT');

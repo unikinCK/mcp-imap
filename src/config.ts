@@ -34,6 +34,12 @@ export interface AccountConfig {
 export interface ServerConfig {
   mode: Mode;
   allowSend: boolean;
+  /** In read-write mode: allow deleting messages and mailboxes. Without it, moves are still possible (verified copy). */
+  allowDelete: boolean;
+  /** Folder that receives the audit log of all changing actions; undefined disables logging. */
+  logFolder?: string;
+  /** Who performs the actions, written to the audit log. */
+  actor?: string;
   accounts: AccountConfig[];
   maxBodyChars: number;
   maxAttachmentBytes: number;
@@ -58,6 +64,8 @@ Options:
                          delete messages, manage mailboxes, save drafts and send mail.
   --mode <mode>          Same as above: "read-only" or "read-write".
   --no-send              In read-write mode, do not expose the send_email tool.
+  --no-delete            In read-write mode, do not allow deleting messages or folders.
+                         Everything else (flags, copy, verified move, drafts) stays possible.
   --config <file>        JSON file with one or more accounts (see README).
   -h, --help             Show this help.
 
@@ -66,7 +74,8 @@ Environment (single account, used when no --config is given):
   IMAP_TLS_REJECT_UNAUTHORIZED (true), IMAP_ACCOUNT_NAME (default)
   SMTP_HOST, SMTP_PORT (465), SMTP_SECURE (true), SMTP_USER, SMTP_PASSWORD,
   SMTP_FROM, SMTP_SAVE_TO_SENT (true)
-  MCP_IMAP_MODE, MCP_IMAP_CONFIG, MCP_IMAP_ALLOW_SEND (true),
+  MCP_IMAP_MODE, MCP_IMAP_CONFIG, MCP_IMAP_ALLOW_SEND (true), MCP_IMAP_ALLOW_DELETE (true),
+  MCP_IMAP_LOG_FOLDER ("MCP Log"; "off" disables the audit log),
   MCP_IMAP_MAX_BODY_CHARS (50000), MCP_IMAP_MAX_ATTACHMENT_BYTES (10485760)
 
 Environment (HTTP server, "serve"):
@@ -220,10 +229,11 @@ export interface CliArgs {
   mode?: Mode;
   configPath?: string;
   noSend: boolean;
+  noDelete: boolean;
 }
 
 export function parseArgs(argv: string[]): CliArgs {
-  const args: CliArgs = { help: false, noSend: false };
+  const args: CliArgs = { help: false, noSend: false, noDelete: false };
   const setMode = (mode: Mode) => {
     if (args.mode && args.mode !== mode) throw new ConfigError('Conflicting mode arguments');
     args.mode = mode;
@@ -259,6 +269,9 @@ export function parseArgs(argv: string[]): CliArgs {
       case '--no-send':
         args.noSend = true;
         break;
+      case '--no-delete':
+        args.noDelete = true;
+        break;
       default:
         throw new ConfigError(`Unknown argument: ${arg}`);
     }
@@ -269,8 +282,17 @@ export function parseArgs(argv: string[]): CliArgs {
 export interface BaseConfig {
   mode: Mode;
   allowSend: boolean;
+  allowDelete: boolean;
+  logFolder?: string;
   maxBodyChars: number;
   maxAttachmentBytes: number;
+}
+
+function parseLogFolder(value: string | undefined): string | undefined {
+  if (value === undefined) return 'MCP Log';
+  const v = value.trim();
+  if (!v || ['off', 'none', 'false', '0', 'no'].includes(v.toLowerCase())) return undefined;
+  return v;
 }
 
 /** Settings shared by the stdio and the HTTP server. */
@@ -279,6 +301,8 @@ export function loadBaseConfig(args: CliArgs, env: NodeJS.ProcessEnv = process.e
     // Read-only is the safe default; write access has to be requested explicitly.
     mode: args.mode ?? (env.MCP_IMAP_MODE ? parseMode(env.MCP_IMAP_MODE, 'MCP_IMAP_MODE') : 'read-only'),
     allowSend: !args.noSend && parseBool(env.MCP_IMAP_ALLOW_SEND, true, 'MCP_IMAP_ALLOW_SEND'),
+    allowDelete: !args.noDelete && parseBool(env.MCP_IMAP_ALLOW_DELETE, true, 'MCP_IMAP_ALLOW_DELETE'),
+    logFolder: parseLogFolder(env.MCP_IMAP_LOG_FOLDER),
     maxBodyChars: parseInt10(env.MCP_IMAP_MAX_BODY_CHARS, 50_000, 'MCP_IMAP_MAX_BODY_CHARS'),
     maxAttachmentBytes: parseInt10(env.MCP_IMAP_MAX_ATTACHMENT_BYTES, 10 * 1024 * 1024, 'MCP_IMAP_MAX_ATTACHMENT_BYTES'),
   };
@@ -288,5 +312,5 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
   const args = parseArgs(argv);
   const configPath = args.configPath ?? env.MCP_IMAP_CONFIG;
   const accounts = configPath ? accountsFromFile(configPath, env) : [accountFromEnv(env)];
-  return { ...loadBaseConfig(args, env), accounts };
+  return { ...loadBaseConfig(args, env), actor: 'local stdio client', accounts };
 }
