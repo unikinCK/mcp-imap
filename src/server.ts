@@ -1,12 +1,20 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { ServerConfig } from './config.js';
-import { AccountManager } from './imap.js';
+import { AccountManager, type ConnectionPool } from './imap.js';
 import { registerReadTools } from './tools/read.js';
 import { registerWriteTools } from './tools/write.js';
 import { VERSION } from './version.js';
 
-export function createServer(config: ServerConfig): { server: McpServer; accounts: AccountManager } {
-  const accounts = new AccountManager(config);
+export interface CreateServerOptions {
+  pool?: ConnectionPool;
+  noAccountsHint?: string;
+}
+
+export function createServer(
+  config: ServerConfig,
+  options: CreateServerOptions = {},
+): { server: McpServer; accounts: AccountManager } {
+  const accounts = new AccountManager(config, options.pool, options.noAccountsHint);
   const readOnly = config.mode === 'read-only';
   const server = new McpServer(
     { name: 'mcp-imap', version: VERSION },

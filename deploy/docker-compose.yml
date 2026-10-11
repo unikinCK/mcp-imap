@@ -1,0 +1,38 @@
+# HTTPS deployment with automatic Let's Encrypt certificates via Caddy.
+# 1. Point the DNS record of MCP_DOMAIN to this host (ports 80 and 443 must be reachable).
+# 2. Create deploy/.env with MCP_DOMAIN, MCP_IMAP_SECRET_KEY and optionally MCP_IMAP_MODE.
+# 3. docker compose up -d
+# 4. docker compose exec mcp-imap node dist/index.js user add <username>
+services:
+  mcp-imap:
+    build: ..
+    restart: unless-stopped
+    command: ["serve"]
+    environment:
+      MCP_IMAP_PUBLIC_URL: https://${MCP_DOMAIN:?set MCP_DOMAIN in .env}
+      MCP_IMAP_SECRET_KEY: ${MCP_IMAP_SECRET_KEY:?set MCP_IMAP_SECRET_KEY in .env}
+      MCP_IMAP_MODE: ${MCP_IMAP_MODE:-read-only}
+      MCP_IMAP_ALLOW_REGISTRATION: ${MCP_IMAP_ALLOW_REGISTRATION:-false}
+      MCP_IMAP_TRUST_PROXY: "true"
+    volumes:
+      - mcp-imap-data:/data
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      MCP_DOMAIN: ${MCP_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - mcp-imap
+
+volumes:
+  mcp-imap-data:
+  caddy-data:
+  caddy-config:

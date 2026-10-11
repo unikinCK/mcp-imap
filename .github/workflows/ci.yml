@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node: [20, 22, 24]
+        node: [22, 24]
     services:
       greenmail:
         image: greenmail/standalone:2.1.14
@@ -31,3 +31,10 @@ jobs:
       - run: npm test
         env:
           IMAP_TEST_HOST: localhost
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t mcp-imap .
+      - run: docker run --rm mcp-imap --help

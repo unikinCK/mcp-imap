@@ -4,3 +4,4 @@ dist/
 .env
 accounts.json
 .DS_Store
+deploy/.env

@@ -22,55 +22,37 @@ class Mutex {
 
 interface AccountState {
   config: AccountConfig;
+  key: string;
   client?: ImapFlow;
   mutex: Mutex;
 }
 
-export class AccountManager {
-  private readonly accounts = new Map<string, AccountState>();
+/**
+ * Holds IMAP connections per account. A pool can outlive a single AccountManager, which lets
+ * the HTTP server reuse connections across requests of the same user.
+ */
+export class ConnectionPool {
+  private readonly states = new Map<string, AccountState>();
+  lastUsed = Date.now();
 
-  constructor(private readonly config: ServerConfig) {
-    for (const account of config.accounts) {
-      this.accounts.set(account.name, { config: account, mutex: new Mutex() });
+  state(account: AccountConfig): AccountState {
+    this.lastUsed = Date.now();
+    const key = JSON.stringify(account.imap);
+    let state = this.states.get(account.name);
+    if (state && state.key !== key) {
+      // Settings changed: drop the old connection and start fresh.
+      state.client?.close();
+      state = undefined;
     }
-  }
-
-  get serverReadOnly(): boolean {
-    return this.config.mode === 'read-only';
-  }
-
-  list(): AccountConfig[] {
-    return this.config.accounts;
-  }
-
-  get(name?: string): AccountConfig {
-    return this.state(name).config;
-  }
-
-  isWritable(name?: string): boolean {
-    return !this.serverReadOnly && !this.get(name).readOnly;
-  }
-
-  assertWritable(name?: string): void {
-    const account = this.get(name);
-    if (this.serverReadOnly) throw new ToolError('The server is running in read-only mode.');
-    if (account.readOnly) throw new ToolError(`Account "${account.name}" is configured as read-only.`);
-  }
-
-  private state(name?: string): AccountState {
-    if (!name) {
-      const first = this.accounts.values().next().value;
-      if (!first) throw new ToolError('No accounts configured.');
-      return first;
-    }
-    const state = this.accounts.get(name);
     if (!state) {
-      throw new ToolError(`Unknown account "${name}". Available: ${[...this.accounts.keys()].join(', ')}`);
+      state = { config: account, key, mutex: new Mutex() };
+      this.states.set(account.name, state);
     }
+    state.config = account;
     return state;
   }
 
-  private async connect(state: AccountState): Promise<ImapFlow> {
+  async connect(state: AccountState): Promise<ImapFlow> {
     if (state.client?.usable) return state.client;
     state.client = undefined;
     const { imap } = state.config;
@@ -80,7 +62,7 @@ export class AccountManager {
       secure: imap.secure,
       auth: { user: imap.user, pass: imap.password },
       tls: { rejectUnauthorized: imap.tlsRejectUnauthorized },
-      // stdout is the MCP transport, so imapflow must never log there.
+      // stdout is the MCP transport in stdio mode, so imapflow must never log there.
       logger: false,
       disableAutoIdle: true,
     });
@@ -95,11 +77,72 @@ export class AccountManager {
     return client;
   }
 
+  async closeAll(): Promise<void> {
+    const states = [...this.states.values()];
+    this.states.clear();
+    await Promise.all(
+      states.map(async (state) => {
+        const client = state.client;
+        state.client = undefined;
+        if (client?.usable) {
+          try {
+            await client.logout();
+          } catch {
+            client.close();
+          }
+        }
+      }),
+    );
+  }
+}
+
+export class AccountManager {
+  private readonly accounts = new Map<string, AccountConfig>();
+
+  constructor(
+    private readonly config: ServerConfig,
+    private readonly pool: ConnectionPool = new ConnectionPool(),
+    private readonly noAccountsHint = 'No accounts configured.',
+  ) {
+    for (const account of config.accounts) this.accounts.set(account.name, account);
+  }
+
+  get serverReadOnly(): boolean {
+    return this.config.mode === 'read-only';
+  }
+
+  list(): AccountConfig[] {
+    return this.config.accounts;
+  }
+
+  get(name?: string): AccountConfig {
+    if (!name) {
+      const first = this.config.accounts[0];
+      if (!first) throw new ToolError(this.noAccountsHint);
+      return first;
+    }
+    const account = this.accounts.get(name);
+    if (!account) {
+      throw new ToolError(`Unknown account "${name}". Available: ${[...this.accounts.keys()].join(', ') || 'none'}`);
+    }
+    return account;
+  }
+
+  isWritable(name?: string): boolean {
+    return !this.serverReadOnly && !this.get(name).readOnly;
+  }
+
+  assertWritable(name?: string): void {
+    const account = this.get(name);
+    if (this.serverReadOnly) throw new ToolError('Write access is not available (read-only mode or missing permission).');
+    if (account.readOnly) throw new ToolError(`Account "${account.name}" is configured as read-only.`);
+  }
+
   /** Runs `fn` with a connected client for the given account. Operations on one account are serialized. */
   async withClient<T>(name: string | undefined, fn: (client: ImapFlow, account: AccountConfig) => Promise<T>): Promise<T> {
-    const state = this.state(name);
+    const state = this.pool.state(this.get(name));
     return state.mutex.run(async () => {
-      const client = await this.connect(state);
+      const client = await this.pool.connect(state);
       try {
         return await fn(client, state.config);
       } catch (err) {
@@ -139,19 +182,7 @@ export class AccountManager {
   }
 
   async closeAll(): Promise<void> {
-    await Promise.all(
-      [...this.accounts.values()].map(async (state) => {
-        const client = state.client;
-        state.client = undefined;
-        if (client?.usable) {
-          try {
-            await client.logout();
-          } catch {
-            client.close();
-          }
-        }
-      }),
-    );
+    await this.pool.closeAll();
   }
 }
 

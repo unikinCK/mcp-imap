@@ -1,0 +1,7 @@
+{$MCP_DOMAIN} {
+	encode gzip
+	reverse_proxy mcp-imap:3000 {
+		# Stream MCP responses (Server-Sent Events) without buffering.
+		flush_interval -1
+	}
+}

@@ -2,7 +2,12 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that gives AI assistants such as Claude access to IMAP mailboxes.
 
-The server is started in one of two modes:
+It runs in two ways:
+
+- **Local (stdio)** – single user, accounts from environment variables or a JSON file. Ideal for Claude Desktop / Claude Code on your own machine.
+- **Remote (Streamable HTTP over HTTPS)** – multi-user server with a built-in **OAuth 2.1** authorization server, login page and a small backend where every user stores their own (encrypted) mail accounts. Can be added to Claude as a custom connector.
+
+In both cases the server is started in one of two modes:
 
 | Mode | Flag | What is possible |
 | --- | --- | --- |
@@ -21,7 +26,7 @@ Features:
 
 ## Requirements
 
-- Node.js 20 or newer
+- Node.js 22.13 or newer (the HTTP server uses the built-in `node:sqlite`)
 - An IMAP account (for many providers, e.g. Gmail, iCloud, Outlook, you need an **app password**)
 
 ## Installation
@@ -38,7 +43,7 @@ Or run it directly from GitHub without cloning:
 npx -y github:unikinCK/mcp-imap --help
 ```
 
-## Configuration
+## Configuration (stdio)
 
 ### Single account via environment variables
 
@@ -95,7 +100,7 @@ See [`examples/accounts.example.json`](examples/accounts.example.json):
 
 Each `imap`/`smtp` block accepts `host`, `port`, `secure`, `user`, `password` or `passwordEnv`, and `tlsRejectUnauthorized`. `smtp` additionally accepts `from` and `saveToSent`. An account with `"readOnly": true` stays read-only even if the server runs with `--read-write`.
 
-## Usage with Claude
+## Local usage with Claude (stdio)
 
 ### Claude Code
 
@@ -133,6 +138,115 @@ If you cloned the repository, use `"command": "node"` and `"args": ["/path/to/mc
 
 A common setup is to register the server twice — once read-only for everyday use and once read-write, enabled only when needed.
 
+## Remote server: Streamable HTTP with OAuth
+
+`mcp-imap serve` starts an HTTP(S) server with
+
+- `POST /mcp` – the MCP endpoint (Streamable HTTP, stateless), protected by OAuth bearer tokens
+- an OAuth 2.1 authorization server: metadata (`/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`), dynamic client registration (`/register`), `/authorize` with PKCE (S256), `/token` with refresh token rotation, `/revoke`
+- a web UI: login, consent screen, management of mail accounts, connected applications and password
+
+```
+MCP client ──(1) POST /mcp → 401 + resource metadata
+           ──(2) register client, open /authorize in the browser
+User       ──(3) logs in, chooses permissions on the consent screen
+MCP client ──(4) exchanges code for tokens, calls POST /mcp with Bearer token
+Server     ──(5) loads the user's encrypted mail accounts, talks IMAP/SMTP
+```
+
+### Permissions (OAuth scopes)
+
+| Scope | Grants |
+| --- | --- |
+| `mail:read` | All read tools (always granted) |
+| `mail:write` | Flag, move, copy, delete, folder management, drafts |
+| `mail:send` | `send_email` (implies `mail:write`) |
+
+The user decides on the consent screen which permissions an application gets – read-only is the default. The server mode is the upper limit: with `serve --read-only` only `mail:read` can be granted. A mail account marked “always read-only” in the web UI is never modified, whatever the token allows.
+
+### Quick start (local test)
+
+```bash
+npm install
+export MCP_IMAP_SECRET_KEY="$(openssl rand -base64 32)"   # keep this value! it encrypts stored mail passwords
+node dist/index.js user add alice                         # prompts for a password
+node dist/index.js serve --read-write                     # http://localhost:3000
+```
+
+Open http://localhost:3000, sign in, add a mail account and click **Test**. Then connect a client to `http://localhost:3000/mcp`, for example with the MCP Inspector (`npx @modelcontextprotocol/inspector`).
+
+### Production with HTTPS
+
+OAuth requires HTTPS for everything except `localhost`. Two options:
+
+**a) Docker Compose with Caddy (automatic Let's Encrypt certificates)** – see [`deploy/`](deploy):
+
+```bash
+cd deploy
+cp .env.example .env        # set MCP_DOMAIN, MCP_IMAP_SECRET_KEY, MCP_IMAP_MODE
+docker compose up -d
+docker compose exec mcp-imap node dist/index.js user add alice
+```
+
+**b) Native TLS** with your own certificate:
+
+```bash
+MCP_IMAP_PUBLIC_URL=https://mail-mcp.example.com \
+MCP_IMAP_TLS_CERT=/etc/ssl/mail-mcp/fullchain.pem \
+MCP_IMAP_TLS_KEY=/etc/ssl/mail-mcp/privkey.pem \
+MCP_IMAP_HTTP_HOST=0.0.0.0 MCP_IMAP_HTTP_PORT=443 \
+MCP_IMAP_SECRET_KEY=... \
+node dist/index.js serve --read-write
+```
+
+Behind another reverse proxy (nginx, Traefik, …) set `MCP_IMAP_TRUST_PROXY=true` and make sure the proxy does not buffer responses (Server-Sent Events).
+
+### Connect Claude
+
+In Claude (Settings → Connectors → *Add custom connector*) enter `https://mail-mcp.example.com/mcp`. Claude registers itself, opens the login page, and after you approve the consent screen the mail tools are available. In Claude Code:
+
+```bash
+claude mcp add --transport http imap https://mail-mcp.example.com/mcp
+```
+
+then run `/mcp` in Claude Code to authenticate.
+
+### HTTP server configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MCP_IMAP_PUBLIC_URL` | `http://localhost:<port>` | External base URL as seen by clients (must be `https://` unless localhost). Used as OAuth issuer |
+| `MCP_IMAP_SECRET_KEY` | – | **Required.** ≥ 32 characters. Encrypts stored mail credentials (AES-256-GCM). Losing it makes stored accounts unreadable |
+| `MCP_IMAP_HTTP_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` in Docker) |
+| `MCP_IMAP_HTTP_PORT` | `3000` | Port |
+| `MCP_IMAP_TLS_CERT` / `MCP_IMAP_TLS_KEY` | – | PEM files to serve HTTPS directly |
+| `MCP_IMAP_DB` | `./data/mcp-imap.db` | SQLite database |
+| `MCP_IMAP_ALLOW_REGISTRATION` | `false` | Allow self-registration on `/register` |
+| `MCP_IMAP_TRUST_PROXY` | `false` | Trust `X-Forwarded-*` from one reverse proxy |
+| `MCP_IMAP_ACCESS_TOKEN_TTL` | `3600` | Access token lifetime in seconds |
+| `MCP_IMAP_REFRESH_TOKEN_TTL` | `2592000` | Refresh token lifetime in seconds (30 days) |
+| `MCP_IMAP_MODE`, `MCP_IMAP_ALLOW_SEND`, `MCP_IMAP_MAX_*` | | Same as for stdio |
+
+### User management
+
+```bash
+mcp-imap user add <username>       # password is prompted (or read from stdin when piped)
+mcp-imap user passwd <username>
+mcp-imap user delete <username>    # also deletes mail accounts and revokes all tokens
+mcp-imap user list
+```
+
+The commands use `MCP_IMAP_DB`; they do not need the secret key.
+
+### What is stored
+
+| Data | Storage |
+| --- | --- |
+| User passwords | scrypt hashes |
+| Mail account settings incl. IMAP/SMTP passwords | AES-256-GCM encrypted with `MCP_IMAP_SECRET_KEY`, bound to the user |
+| Access/refresh tokens, authorization codes, web sessions | SHA-256 hashes only |
+| Registered OAuth clients | plain (public metadata) |
+
 ## Tools
 
 ### Always available (read-only)
@@ -161,19 +275,22 @@ A common setup is to register the server twice — once read-only for everyday u
 
 All tools take an optional `account` argument; without it, the first configured account is used. Messages are addressed by their IMAP **UID** within a mailbox.
 
+On the HTTP server, the write tools are only listed if the server runs in read-write mode **and** the access token has the `mail:write` scope (`send_email` additionally needs `mail:send`).
+
 ## Security notes
 
 - Start in read-only mode unless you really need write access. In read-only mode, write tools do not exist for the model, and the IMAP session cannot modify mailboxes.
 - Use app passwords and keep them out of config files by using `passwordEnv`.
 - Tool results contain email content, which is untrusted input. A malicious email could try to instruct the model ("prompt injection"). Review actions such as sending or deleting before approving them in your client.
 - Use `--no-send` if you want write access to mailboxes but never want the model to send email.
+- HTTP server: keep `MCP_IMAP_SECRET_KEY` secret and backed up, keep registration disabled unless you need it, and run it only behind HTTPS. The web UI uses `__Host-` cookies, CSRF tokens, a strict Content-Security-Policy and rate-limited login. Users can revoke connected applications at any time.
 
 ## Development
 
 ```bash
 npm install
 npm run build
-npm test                 # unit tests; integration tests are skipped without a server
+npm test                 # unit + HTTP/OAuth tests; mailbox tests are skipped without a server
 ```
 
 Integration tests run against [GreenMail](https://greenmail-mail-test.github.io/greenmail/):

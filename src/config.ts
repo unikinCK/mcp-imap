@@ -43,7 +43,13 @@ export class ConfigError extends Error {}
 
 const HELP = `mcp-imap - MCP server for IMAP mailboxes
 
-Usage: mcp-imap [options]
+Usage:
+  mcp-imap [options]                 Run as local stdio server (single user, accounts from env/config)
+  mcp-imap serve [options]           Run as Streamable HTTP server with OAuth login and user backend
+  mcp-imap user add <username>       Create a user for the HTTP server (password is prompted)
+  mcp-imap user passwd <username>    Change a user's password
+  mcp-imap user delete <username>    Delete a user and all stored data
+  mcp-imap user list                 List users
 
 Options:
   --read-only            Start in read-only mode (default). No write tools are exposed
@@ -62,6 +68,12 @@ Environment (single account, used when no --config is given):
   SMTP_FROM, SMTP_SAVE_TO_SENT (true)
   MCP_IMAP_MODE, MCP_IMAP_CONFIG, MCP_IMAP_ALLOW_SEND (true),
   MCP_IMAP_MAX_BODY_CHARS (50000), MCP_IMAP_MAX_ATTACHMENT_BYTES (10485760)
+
+Environment (HTTP server, "serve"):
+  MCP_IMAP_PUBLIC_URL (https://... as seen by clients), MCP_IMAP_SECRET_KEY (required),
+  MCP_IMAP_HTTP_HOST (127.0.0.1), MCP_IMAP_HTTP_PORT (3000), MCP_IMAP_TLS_CERT, MCP_IMAP_TLS_KEY,
+  MCP_IMAP_DB (./data/mcp-imap.db), MCP_IMAP_ALLOW_REGISTRATION (false), MCP_IMAP_TRUST_PROXY (false),
+  MCP_IMAP_ACCESS_TOKEN_TTL (3600), MCP_IMAP_REFRESH_TOKEN_TTL (2592000)
 `;
 
 export function helpText(): string {
@@ -254,17 +266,27 @@ export function parseArgs(argv: string[]): CliArgs {
   return args;
 }
 
-export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env): ServerConfig {
-  const args = parseArgs(argv);
-  // Read-only is the safe default; write access has to be requested explicitly.
-  const mode = args.mode ?? (env.MCP_IMAP_MODE ? parseMode(env.MCP_IMAP_MODE, 'MCP_IMAP_MODE') : 'read-only');
-  const configPath = args.configPath ?? env.MCP_IMAP_CONFIG;
-  const accounts = configPath ? accountsFromFile(configPath, env) : [accountFromEnv(env)];
+export interface BaseConfig {
+  mode: Mode;
+  allowSend: boolean;
+  maxBodyChars: number;
+  maxAttachmentBytes: number;
+}
+
+/** Settings shared by the stdio and the HTTP server. */
+export function loadBaseConfig(args: CliArgs, env: NodeJS.ProcessEnv = process.env): BaseConfig {
   return {
-    mode,
+    // Read-only is the safe default; write access has to be requested explicitly.
+    mode: args.mode ?? (env.MCP_IMAP_MODE ? parseMode(env.MCP_IMAP_MODE, 'MCP_IMAP_MODE') : 'read-only'),
     allowSend: !args.noSend && parseBool(env.MCP_IMAP_ALLOW_SEND, true, 'MCP_IMAP_ALLOW_SEND'),
-    accounts,
     maxBodyChars: parseInt10(env.MCP_IMAP_MAX_BODY_CHARS, 50_000, 'MCP_IMAP_MAX_BODY_CHARS'),
     maxAttachmentBytes: parseInt10(env.MCP_IMAP_MAX_ATTACHMENT_BYTES, 10 * 1024 * 1024, 'MCP_IMAP_MAX_ATTACHMENT_BYTES'),
   };
+}
+
+export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env): ServerConfig {
+  const args = parseArgs(argv);
+  const configPath = args.configPath ?? env.MCP_IMAP_CONFIG;
+  const accounts = configPath ? accountsFromFile(configPath, env) : [accountFromEnv(env)];
+  return { ...loadBaseConfig(args, env), accounts };
 }
