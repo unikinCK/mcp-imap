@@ -23,12 +23,41 @@ export interface SmtpSettings {
   saveToSent: boolean;
 }
 
+/**
+ * Upper limit of what may be done with one mailbox, independent of server mode and app permissions:
+ * read = nothing is changed; organize = flags, copy, verified move, folders, drafts (no delete, no send);
+ * organize-send = organize plus sending; full = additionally delete messages and folders.
+ */
+export type AccessLevel = 'read' | 'organize' | 'organize-send' | 'full';
+
+export const ACCESS_LEVELS: AccessLevel[] = ['read', 'organize', 'organize-send', 'full'];
+
+export function parseAccessLevel(value: unknown, ctx: string): AccessLevel {
+  const v = String(value).trim().toLowerCase();
+  if ((ACCESS_LEVELS as string[]).includes(v)) return v as AccessLevel;
+  throw new ConfigError(`Invalid access level for ${ctx}: ${String(value)}. Use one of ${ACCESS_LEVELS.join(', ')}.`);
+}
+
+/** Resolves the access level from settings, accepting the legacy `readOnly` flag (default: full). */
+export function accessLevelOf(settings: { access?: unknown; readOnly?: unknown }, ctx = 'account'): AccessLevel {
+  if (settings.access !== undefined && settings.access !== null && settings.access !== '') {
+    return parseAccessLevel(settings.access, ctx);
+  }
+  return settings.readOnly === true || settings.readOnly === 'true' ? 'read' : 'full';
+}
+
+export function levelAllows(level: AccessLevel, what: 'write' | 'delete' | 'send'): boolean {
+  if (what === 'write') return level !== 'read';
+  if (what === 'delete') return level === 'full';
+  return level === 'organize-send' || level === 'full';
+}
+
 export interface AccountConfig {
   name: string;
   imap: ImapSettings;
   smtp?: SmtpSettings;
-  /** Forces this account into read-only mode even if the server runs in read-write mode. */
-  readOnly: boolean;
+  /** Upper limit for this mailbox, see AccessLevel. */
+  access: AccessLevel;
 }
 
 export interface ServerConfig {
@@ -188,7 +217,10 @@ function accountsFromFile(path: string, env: NodeJS.ProcessEnv): AccountConfig[]
       name,
       imap,
       smtp: buildSmtp(raw.smtp as Record<string, unknown> | undefined, imap, env, `accounts[${name}].smtp`),
-      readOnly: parseBool(raw.readOnly, false, `accounts[${name}].readOnly`),
+      access: accessLevelOf(
+        { access: raw.access, readOnly: parseBool(raw.readOnly, false, `accounts[${name}].readOnly`) },
+        `accounts[${name}].access`,
+      ),
     };
   });
 }
@@ -221,7 +253,8 @@ function accountFromEnv(env: NodeJS.ProcessEnv): AccountConfig {
     env,
     'SMTP',
   );
-  return { name: env.IMAP_ACCOUNT_NAME || 'default', imap, smtp, readOnly: false };
+  // The server mode and --no-delete / --no-send already limit the single env account.
+  return { name: env.IMAP_ACCOUNT_NAME || 'default', imap, smtp, access: 'full' };
 }
 
 export interface CliArgs {

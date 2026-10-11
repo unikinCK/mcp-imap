@@ -113,7 +113,9 @@ See [`examples/accounts.example.json`](examples/accounts.example.json):
 }
 ```
 
-Each `imap`/`smtp` block accepts `host`, `port`, `secure`, `user`, `password` or `passwordEnv`, and `tlsRejectUnauthorized`. `smtp` additionally accepts `from` and `saveToSent`. An account with `"readOnly": true` stays read-only even if the server runs with `--read-write`.
+Each `imap`/`smtp` block accepts `host`, `port`, `secure`, `user`, `password` or `passwordEnv`, and `tlsRejectUnauthorized`. `smtp` additionally accepts `from` and `saveToSent`.
+
+Each account can have an `access` level as upper limit, independent of the server mode: `read`, `organize` (flags, copy, verified move, folders, drafts – no delete, no send), `organize-send` (plus sending) or `full` (default). The older `"readOnly": true` is still accepted and means `read`.
 
 ## Local usage with Claude (stdio)
 
@@ -179,7 +181,9 @@ Server     ──(5) loads the user's encrypted mail accounts, talks IMAP/SMTP
 | `mail:send` | `send_email` (implies `mail:organize`) |
 | `mail:write` | Legacy scope from v0.2.0, still accepted: `mail:organize` + `mail:delete` |
 
-The user decides on the consent screen which permissions an application gets – read-only is the default, and every permission can be ticked separately (e.g. organize without delete and without send). The server mode is the upper limit: with `serve --read-only` only `mail:read` can be granted. A mail account marked “always read-only” in the web UI is never modified, whatever the token allows.
+The user decides on the consent screen which permissions an application gets – read-only is the default, and every permission can be ticked separately (e.g. organize without delete and without send). The server mode is the upper limit: with `serve --read-only` only `mail:read` can be granted.
+
+In addition, every **mail account** has its own permission level in the web UI (*Read only*, *Organize*, *Organize + send*, *Full access*), chosen when adding it and changeable with *Edit*. An application can never do more than both its granted scopes and the account level allow. Accounts created before v0.3.1 keep full access until you change them; to change what an already connected app may do, revoke it under *Connected applications* and connect it again.
 
 ### Quick start (local test)
 

@@ -1,5 +1,5 @@
 import { ImapFlow, type ListResponse } from 'imapflow';
-import type { AccountConfig, ServerConfig } from './config.js';
+import { type AccountConfig, levelAllows, type ServerConfig } from './config.js';
 
 export class ToolError extends Error {}
 
@@ -129,13 +129,41 @@ export class AccountManager {
   }
 
   isWritable(name?: string): boolean {
-    return !this.serverReadOnly && !this.get(name).readOnly;
+    return !this.serverReadOnly && levelAllows(this.get(name).access, 'write');
+  }
+
+  canDelete(name?: string): boolean {
+    return this.isWritable(name) && this.config.allowDelete && levelAllows(this.get(name).access, 'delete');
+  }
+
+  canSend(name?: string): boolean {
+    const account = this.get(name);
+    return this.isWritable(name) && this.config.allowSend && levelAllows(account.access, 'send') && Boolean(account.smtp);
   }
 
   assertWritable(name?: string): void {
     const account = this.get(name);
     if (this.serverReadOnly) throw new ToolError('Write access is not available (read-only mode or missing permission).');
-    if (account.readOnly) throw new ToolError(`Account "${account.name}" is configured as read-only.`);
+    if (!levelAllows(account.access, 'write')) throw new ToolError(`Account "${account.name}" is set to read only.`);
+  }
+
+  assertCanDelete(name?: string): void {
+    this.assertWritable(name);
+    const account = this.get(name);
+    if (!this.config.allowDelete) throw new ToolError('Deleting is not permitted.');
+    if (!levelAllows(account.access, 'delete')) {
+      throw new ToolError(`Deleting is not permitted for account "${account.name}" (access level "${account.access}").`);
+    }
+  }
+
+  assertCanSend(name?: string): void {
+    this.assertWritable(name);
+    const account = this.get(name);
+    if (!this.config.allowSend) throw new ToolError('Sending is not permitted.');
+    if (!levelAllows(account.access, 'send')) {
+      throw new ToolError(`Sending is not permitted for account "${account.name}" (access level "${account.access}").`);
+    }
+    if (!account.smtp) throw new ToolError(`Account "${account.name}" has no SMTP server configured.`);
   }
 
   /** Runs `fn` with a connected client for the given account. Operations on one account are serialized. */

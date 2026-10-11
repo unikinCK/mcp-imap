@@ -270,7 +270,7 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
       description:
         'Moves messages to another mailbox as a verified copy: the messages are copied, each copy is checked in the ' +
         'destination, and only then the originals are removed. Originals whose copy cannot be verified are kept.' +
-        (config.allowDelete ? '' : ' Moving to Trash is not allowed (no delete permission).') +
+        ' Moving to Trash requires delete permission.' +
         logNote,
       inputSchema: { account: accountArg, mailbox: mailboxArg, uids: uidsArg, destination: z.string() },
       annotations: { ...WRITE, idempotentHint: false },
@@ -280,7 +280,7 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
       if (destination === mailbox) throw new ToolError('Source and destination are the same mailbox.');
       return accounts.withClient(account, async (client, acc) => {
         audit.assertNotLogFolder(client, mailbox, destination);
-        if (!config.allowDelete) {
+        if (!accounts.canDelete(account)) {
           const trash = await findSpecialUse(client, '\\Trash');
           if (trash && trash.path.toLowerCase() === destination.toLowerCase()) {
             throw new ToolError('Moving messages to Trash counts as deleting, which is not permitted.');
@@ -425,10 +425,9 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
     }),
   );
 
-  if (config.allowDelete) registerDeleteTools(server, accounts, audit, logNote);
+  if (accounts.list().some((a) => accounts.canDelete(a.name))) registerDeleteTools(server, accounts, audit, logNote);
 
-  const canSendSomewhere = config.allowSend && accounts.list().some((a) => a.smtp && accounts.isWritable(a.name));
-  if (!canSendSomewhere) return;
+  if (!accounts.list().some((a) => accounts.canSend(a.name))) return;
 
   server.registerTool(
     'send_email',
@@ -445,10 +444,9 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     handler(async (args) => {
-      accounts.assertWritable(args.account);
+      accounts.assertCanSend(args.account);
       const account = accounts.get(args.account);
-      const smtp = account.smtp;
-      if (!smtp) throw new ToolError(`Account "${account.name}" has no SMTP server configured.`);
+      const smtp = account.smtp!;
       if (!args.to && !args.cc && !args.bcc && !args.reply_to_message) throw new ToolError('At least one recipient is required.');
 
       return accounts.withClient(args.account, async (client) => {
@@ -533,7 +531,7 @@ function registerDeleteTools(server: McpServer, accounts: AccountManager, audit:
       annotations: DESTRUCTIVE,
     },
     handler(async ({ account, mailbox, uids, permanent }) => {
-      accounts.assertWritable(account);
+      accounts.assertCanDelete(account);
       return accounts.withClient(account, async (client, acc) => {
         audit.assertNotLogFolder(client, mailbox);
         const trash = permanent ? undefined : await findSpecialUse(client, '\\Trash');
@@ -584,7 +582,7 @@ function registerDeleteTools(server: McpServer, accounts: AccountManager, audit:
       annotations: DESTRUCTIVE,
     },
     handler(async ({ account, path }) => {
-      accounts.assertWritable(account);
+      accounts.assertCanDelete(account);
       if (path.toUpperCase() === 'INBOX') throw new ToolError('INBOX cannot be deleted.');
       return accounts.withClient(account, async (client, acc) => {
         audit.assertNotLogFolder(client, path);

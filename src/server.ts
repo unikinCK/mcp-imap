@@ -31,6 +31,7 @@ export function createServer(
     },
   );
   registerReadTools(server, accounts, config);
-  if (!readOnly) registerWriteTools(server, accounts, config);
+  // Write tools only exist if at least one mailbox may be changed.
+  if (!readOnly && accounts.list().some((a) => accounts.isWritable(a.name))) registerWriteTools(server, accounts, config);
   return { server, accounts };
 }

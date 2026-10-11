@@ -69,14 +69,17 @@ test('loads multiple accounts from a config file with passwordEnv', () => {
     JSON.stringify({
       accounts: [
         { name: 'work', imap: { host: 'imap.work.com', user: 'a@work.com', passwordEnv: 'WORK_PW' } },
+        { name: 'shared', access: 'organize', imap: { host: 'imap.work.com', user: 'b@work.com', password: 'pw' } },
         { name: 'private', readOnly: true, imap: { host: 'imap.home.com', port: 143, secure: false, user: 'b', password: 'pw' } },
       ],
     }),
   );
   const config = loadConfig(['--config', file, '--read-write'], { WORK_PW: 'pw1' });
-  assert.equal(config.accounts.length, 2);
+  assert.equal(config.accounts.length, 3);
   assert.equal(config.accounts[0].imap.password, 'pw1');
-  assert.equal(config.accounts[1].readOnly, true);
-  assert.equal(config.accounts[1].imap.port, 143);
+  assert.equal(config.accounts[0].access, 'full');
+  assert.equal(config.accounts[1].access, 'organize');
+  assert.equal(config.accounts[2].access, 'read', 'legacy readOnly maps to access "read"');
+  assert.equal(config.accounts[2].imap.port, 143);
   assert.throws(() => loadConfig(['--config', file], {}), /WORK_PW is not set/);
 });

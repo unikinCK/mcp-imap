@@ -2,6 +2,7 @@ import express, { type Request, type Response, type Router } from 'express';
 import { rateLimit } from 'express-rate-limit';
 import { ImapFlow } from 'imapflow';
 import nodemailer from 'nodemailer';
+import { ACCESS_LEVELS, type AccessLevel } from '../config.js';
 import type { HttpConfig } from './config.js';
 import { randomToken, safeEqual } from './crypto.js';
 import { grantableScopes, normalizeScopes } from './oauth.js';
@@ -95,7 +96,8 @@ function settingsFromForm(body: Record<string, unknown>, previous?: MailAccountS
       saveToSent: body.smtp_save_to_sent === '1',
     };
   }
-  return { name, settings: { imap, smtp, readOnly: body.read_only === '1' } };
+  const access = (ACCESS_LEVELS as string[]).includes(String(body.access)) ? (body.access as AccessLevel) : 'organize';
+  return { name, settings: { imap, smtp, access } };
 }
 
 async function testAccount(settings: MailAccountSettings): Promise<string> {

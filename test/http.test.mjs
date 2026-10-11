@@ -225,6 +225,7 @@ describe('http server', () => {
         smtp_host: imapHost ?? 'smtp.invalid',
         smtp_port: smtpPort,
         smtp_save_to_sent: '1',
+        access: 'full',
       },
     });
     assert.equal(res.status, 303);
@@ -272,6 +273,53 @@ describe('http server', () => {
 
     // Legacy scope from v0.2.0 maps to organize + delete
     assert.equal((await toolsFor(['mail:write'])).scope, 'mail:read mail:organize mail:delete');
+  });
+
+  test('the mail account permission level caps what a fully authorized app can do', async () => {
+    const page = await (await browser.request('/account')).text();
+    const id = /\/account\/mail\/(\d+)\/test/.exec(page)[1];
+    assert.match(page, /Full access/);
+    const save = (access) =>
+      browser.request(`/account/mail/${id}`, {
+        method: 'POST',
+        form: {
+          csrf: browser.csrf(),
+          name: 'test',
+          imap_host: imapHost ?? 'imap.invalid',
+          imap_port: imapPort,
+          imap_user: mailUser,
+          smtp_host: imapHost ?? 'smtp.invalid',
+          smtp_port: smtpPort,
+          smtp_save_to_sent: '1',
+          access,
+        },
+      });
+    const toolsWithFullGrant = async () => {
+      const tokens = await authorize(browser, client, ['mail:organize', 'mail:delete', 'mail:send']);
+      const mcp = await mcpClient(tokens.access_token);
+      const names = (await mcp.listTools()).tools.map((t) => t.name);
+      const accounts = JSON.parse((await mcp.callTool({ name: 'list_accounts', arguments: {} })).content[0].text).accounts;
+      await mcp.close();
+      return { names, account: accounts[0] };
+    };
+
+    assert.equal((await save('organize')).status, 303);
+    let result = await toolsWithFullGrant();
+    assert.equal(result.account.access, 'organize');
+    assert.ok(result.names.includes('move_messages'));
+    assert.ok(!result.names.includes('delete_messages') && !result.names.includes('send_email'));
+
+    assert.equal((await save('organize-send')).status, 303);
+    result = await toolsWithFullGrant();
+    assert.ok(result.names.includes('send_email') && !result.names.includes('delete_messages'));
+
+    assert.equal((await save('read')).status, 303);
+    result = await toolsWithFullGrant();
+    assert.ok(!result.names.includes('move_messages') && result.names.includes('list_messages'));
+
+    assert.equal((await save('full')).status, 303);
+    result = await toolsWithFullGrant();
+    assert.ok(result.names.includes('delete_messages'));
   });
 
   test('works with a real mailbox', { skip: !imapHost && 'IMAP_TEST_HOST not set' }, async () => {

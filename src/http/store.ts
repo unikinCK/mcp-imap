@@ -2,7 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
-import type { AccountConfig, ImapSettings, SmtpSettings } from '../config.js';
+import { type AccessLevel, type AccountConfig, accessLevelOf, type ImapSettings, type SmtpSettings } from '../config.js';
 import { hashPassword, hashToken, randomToken, SecretBox, verifyPassword } from './crypto.js';
 
 export interface User {
@@ -14,7 +14,7 @@ export interface User {
 export interface MailAccountSettings {
   imap: ImapSettings;
   smtp?: SmtpSettings;
-  readOnly: boolean;
+  access: AccessLevel;
 }
 
 export interface MailAccount {
@@ -218,11 +218,12 @@ export class Store {
     const rows = this.db
       .prepare('SELECT id, name, data FROM mail_accounts WHERE user_id = ? ORDER BY id')
       .all(userId) as { id: number; name: string; data: string }[];
-    return rows.map((row) => ({
-      id: row.id,
-      name: row.name,
-      settings: JSON.parse(this.secretBox().decrypt(row.data, `mail_account:${userId}`)) as MailAccountSettings,
-    }));
+    return rows.map((row) => {
+      const stored = JSON.parse(this.secretBox().decrypt(row.data, `mail_account:${userId}`));
+      // Accounts saved before v0.3.1 have a readOnly flag instead of an access level.
+      const { readOnly: _legacy, ...settings } = stored;
+      return { id: row.id, name: row.name, settings: { ...settings, access: accessLevelOf(stored) } as MailAccountSettings };
+    });
   }
 
   getMailAccount(userId: number, id: number): MailAccount | undefined {

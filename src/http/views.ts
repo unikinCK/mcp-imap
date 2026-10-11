@@ -1,3 +1,4 @@
+import type { AccessLevel } from '../config.js';
 import type { Grant, MailAccount, User } from './store.js';
 import { SCOPE_DESCRIPTIONS, SCOPES } from './oauth.js';
 
@@ -137,9 +138,33 @@ ${
 <input type="hidden" name="csrf" value="${esc(opts.csrf)}"><input type="hidden" name="request" value="${esc(opts.requestId)}">
 <input type="hidden" name="scope" value="${SCOPES.read}">
 <fieldset><legend>Permissions</legend>${checks}</fieldset>
+<p class="muted">The permission level of each mail account still applies on top of this (see your account page).</p>
 <div class="actions"><button type="submit" name="action" value="approve">Allow</button>
 <button class="secondary" type="submit" name="action" value="deny">Deny</button></div></form></div>`,
   );
+}
+
+export const ACCESS_LABELS: Record<AccessLevel, { title: string; text: string }> = {
+  read: { title: 'Read only', text: 'Messages can be listed, searched and read. Nothing is changed.' },
+  organize: {
+    title: 'Organize',
+    text: 'Additionally flag, copy and move messages (verified), create/rename folders, save drafts. No deleting, no sending.',
+  },
+  'organize-send': { title: 'Organize + send', text: 'Like Organize, plus sending emails. No deleting.' },
+  full: { title: 'Full access', text: 'Everything, including deleting messages and folders.' },
+};
+
+const ACCESS_ORDER: AccessLevel[] = ['read', 'organize', 'organize-send', 'full'];
+
+function accessFieldset(current: AccessLevel): string {
+  return `<fieldset><legend>Permissions for this mailbox</legend>
+<p class="muted">The most any connected app may do with this mailbox. Apps get the smaller of this level and the
+permissions you grant when connecting them. Every change is recorded in the “MCP Log” folder.</p>
+${ACCESS_ORDER.map(
+  (level) => `<label class="check"><input type="radio" name="access" value="${level}"${level === current ? ' checked' : ''}>
+<span><strong>${esc(ACCESS_LABELS[level].title)}</strong><br><span class="muted">${esc(ACCESS_LABELS[level].text)}</span></span></label>`,
+).join('\n')}
+</fieldset>`;
 }
 
 function accountForm(csrf: string, account?: MailAccount): string {
@@ -170,7 +195,7 @@ function accountForm(csrf: string, account?: MailAccount): string {
 <label>From address</label><input type="text" name="smtp_from" placeholder="Jane Doe &lt;jane@example.com&gt;" value="${v(s?.smtp?.from)}">
 <label class="check"><input type="checkbox" name="smtp_save_to_sent" value="1"${checked(s?.smtp?.saveToSent, true)}> Save sent messages to the Sent folder (disable for Gmail)</label>
 </fieldset>
-<label class="check"><input type="checkbox" name="read_only" value="1"${checked(s?.readOnly, false)}> Always read-only (no changes, no sending, regardless of granted permissions)</label>
+${accessFieldset(s?.access ?? 'organize')}
 <div class="actions"><button type="submit">${account ? 'Save' : 'Add account'}</button>${
     account ? '<a class="button secondary" href="/account">Cancel</a>' : ''
   }</div></form>`;
@@ -181,9 +206,9 @@ export function accountPage(
 ): string {
   const csrf = esc(opts.csrf);
   const accounts = opts.accounts.length
-    ? `<table><tr><th>Name</th><th>Login</th><th></th></tr>${opts.accounts
+    ? `<table><tr><th>Name / permissions</th><th>Login</th><th></th></tr>${opts.accounts
         .map(
-          (a) => `<tr><td><strong>${esc(a.name)}</strong>${a.settings.readOnly ? ' <span class="muted">(read-only)</span>' : ''}</td>
+          (a) => `<tr><td><strong>${esc(a.name)}</strong><br><span class="muted">${esc(ACCESS_LABELS[a.settings.access].title)}</span></td>
 <td>${esc(a.settings.imap.user)}<br><span class="muted">${esc(a.settings.imap.host)}${a.settings.smtp ? ' · SMTP ' + esc(a.settings.smtp.host) : ''}</span></td>
 <td class="row-actions">
 <form method="post" action="/account/mail/${a.id}/test" class="inline"><input type="hidden" name="csrf" value="${csrf}"><button class="secondary" type="submit">Test</button></form>
@@ -211,7 +236,10 @@ export function accountPage(
     `<div class="card"><h1>Your MCP server</h1>
 <p>Add this URL as a remote MCP server / custom connector in Claude or another MCP client:</p>
 <p><code>${esc(opts.mcpUrl)}</code></p>
-<p class="muted">Server mode: <strong>${esc(opts.mode)}</strong>. You choose the permissions for each application when you connect it.</p></div>
+<p class="muted">Server mode: <strong>${esc(opts.mode)}</strong>.</p>
+<p class="muted">Permissions work in two layers: each <strong>mail account</strong> has an upper limit (change it with
+<em>Edit</em>), and each <strong>connected application</strong> gets the permissions you tick when connecting it. An
+app can never do more than both allow. To change an app’s permissions, revoke it below and connect it again.</p></div>
 <div class="card"><h2>Mail accounts</h2>${accounts}</div>
 <div class="card"><h2>Add mail account</h2>${accountForm(opts.csrf)}</div>
 <div class="card"><h2>Connected applications</h2>${grants}</div>
