@@ -1,0 +1,52 @@
+{
+  "name": "mcp-imap",
+  "version": "0.1.0",
+  "description": "Model Context Protocol (MCP) server for IMAP mailboxes with read-only and read-write modes",
+  "type": "module",
+  "bin": {
+    "mcp-imap": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/index.js",
+    "prepare": "npm run build",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/config.test.mjs test/integration.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "imap",
+    "email",
+    "smtp",
+    "claude"
+  ],
+  "author": "Christoph Kloberdanz",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/unikinCK/mcp-imap.git"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "html-to-text": "^10.0.1",
+    "imapflow": "^2.4.0",
+    "nodemailer": "^10.1.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/html-to-text": "^9.0.4",
+    "@types/node": "^26.6.5",
+    "@types/nodemailer": "^8.0.2",
+    "typescript": "^7.0.2"
+  }
+}

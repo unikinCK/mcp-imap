@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22, 24]
+    services:
+      greenmail:
+        image: greenmail/standalone:2.1.14
+        env:
+          GREENMAIL_OPTS: -Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled
+        ports:
+          - 3025:3025
+          - 3143:3143
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - name: Wait for GreenMail
+        run: for i in $(seq 1 60); do nc -z localhost 3143 && exit 0; sleep 1; done; exit 1
+      - run: npm test
+        env:
+          IMAP_TEST_HOST: localhost

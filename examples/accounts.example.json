@@ -1,0 +1,29 @@
+{
+  "accounts": [
+    {
+      "name": "work",
+      "imap": {
+        "host": "imap.example.com",
+        "port": 993,
+        "secure": true,
+        "user": "jane@example.com",
+        "passwordEnv": "WORK_MAIL_PASSWORD"
+      },
+      "smtp": {
+        "host": "smtp.example.com",
+        "port": 465,
+        "secure": true,
+        "from": "Jane Doe <jane@example.com>"
+      }
+    },
+    {
+      "name": "private",
+      "readOnly": true,
+      "imap": {
+        "host": "imap.mailbox.org",
+        "user": "jane@mailbox.org",
+        "passwordEnv": "PRIVATE_MAIL_PASSWORD"
+      }
+    }
+  ]
+}
