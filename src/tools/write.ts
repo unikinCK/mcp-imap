@@ -7,6 +7,14 @@ import type Mail from 'nodemailer/lib/mailer/index.js';
 import { z } from 'zod';
 import type { AccountConfig, ServerConfig } from '../config.js';
 import { AuditLog, describeMessages } from '../audit.js';
+import {
+  type AttachmentRef,
+  ByteBudget,
+  forwardBodies,
+  forwardSubject,
+  loadAttachmentRefs,
+  loadForwardSource,
+} from '../forward.js';
 import { type AccountManager, findSpecialUse, ToolError } from '../imap.js';
 import { formatAddresses, parseHeaders } from '../messages.js';
 import { accountArg, handler, json, mailboxArg, uidsArg } from './common.js';
@@ -62,7 +70,22 @@ const composeSchema = {
       }),
     )
     .max(20)
-    .optional(),
+    .optional()
+    .describe('New attachments provided as text or base64. To reuse attachments of existing messages use attach_from_messages.'),
+  attach_from_messages: z
+    .array(
+      z.object({
+        mailbox: z.string().default('INBOX'),
+        uid: z.number().int().positive(),
+        part: z.string().optional().describe('Attachment part id from get_message; omit to attach all attachments of the message.'),
+      }),
+    )
+    .max(20)
+    .optional()
+    .describe(
+      'Attach attachments of existing messages. They are copied on the server, so even large files (PDFs) work ' +
+        'without transferring their content through the conversation.',
+    ),
 };
 
 type ComposeArgs = {
@@ -74,7 +97,15 @@ type ComposeArgs = {
   html?: string;
   reply_to_message?: { mailbox: string; uid: number };
   attachments?: { filename: string; content?: string; content_base64?: string; content_type?: string }[];
+  attach_from_messages?: AttachmentRef[];
 };
+
+interface ComposeExtra {
+  attachments?: Mail.Attachment[];
+  text?: string;
+  html?: string;
+  references?: string;
+}
 
 interface ReplyContext {
   mailbox: string;
@@ -107,9 +138,11 @@ function fromAddress(account: AccountConfig): string {
   return account.smtp?.from ?? account.imap.user;
 }
 
-async function buildMessage(account: AccountConfig, args: ComposeArgs, reply?: ReplyContext) {
+async function buildMessage(account: AccountConfig, args: ComposeArgs, reply?: ReplyContext, extra: ComposeExtra = {}) {
   const to = args.to ?? reply?.replyTo;
-  if (!args.text && !args.html) throw new ToolError('Either text or html body is required.');
+  const text = extra.text ?? args.text;
+  const html = extra.html ?? args.html;
+  if (!text && !html) throw new ToolError('Either text or html body is required.');
   let subject = args.subject;
   if (subject === undefined && reply) {
     const original = reply.subject ?? '';
@@ -123,26 +156,37 @@ async function buildMessage(account: AccountConfig, args: ComposeArgs, reply?: R
     cc: args.cc,
     bcc: args.bcc,
     subject: subject ?? '',
-    text: args.text,
-    html: args.html,
+    text,
+    html,
     date: new Date(),
     messageId: `<${randomUUID()}@${domain}>`,
-    attachments: args.attachments?.map((a) => {
-      if (a.content === undefined && a.content_base64 === undefined) {
-        throw new ToolError(`Attachment "${a.filename}" needs content or content_base64.`);
-      }
-      return a.content_base64 !== undefined
-        ? { filename: a.filename, content: Buffer.from(a.content_base64, 'base64'), contentType: a.content_type }
-        : { filename: a.filename, content: a.content, contentType: a.content_type };
-    }),
+    attachments: [
+      ...(args.attachments ?? []).map((a): Mail.Attachment => {
+        if (a.content === undefined && a.content_base64 === undefined) {
+          throw new ToolError(`Attachment "${a.filename}" needs content or content_base64.`);
+        }
+        return a.content_base64 !== undefined
+          ? { filename: a.filename, content: Buffer.from(a.content_base64, 'base64'), contentType: a.content_type }
+          : { filename: a.filename, content: a.content, contentType: a.content_type };
+      }),
+      ...(extra.attachments ?? []),
+    ],
   };
+  if (extra.references) options.references = extra.references;
   if (reply?.messageId) {
     options.inReplyTo = reply.messageId;
     options.references = [reply.references, reply.messageId].filter(Boolean).join(' ');
   }
   const mail = new MailComposer(options).compile();
   const raw = await mail.build();
-  return { raw, envelope: mail.getEnvelope(), messageId: options.messageId as string, subject: options.subject as string };
+  const attachmentNames = (options.attachments ?? []).map((a) => a.filename || (a.cid ? `inline:${a.cid}` : 'unnamed'));
+  return {
+    raw,
+    envelope: mail.getEnvelope(),
+    messageId: options.messageId as string,
+    subject: options.subject as string,
+    attachmentNames,
+  };
 }
 
 const WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } as const;
@@ -409,7 +453,8 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
       return accounts.withClient(args.account, async (client, account) => {
         audit.assertNotLogFolder(client, args.drafts_mailbox);
         const reply = args.reply_to_message ? await loadReplyContext(client, args.reply_to_message) : undefined;
-        const { raw, messageId, envelope, subject } = await buildMessage(account, args, reply);
+        const attachments = await loadAttachmentRefs(client, args.attach_from_messages ?? [], new ByteBudget());
+        const { raw, messageId, envelope, subject, attachmentNames } = await buildMessage(account, args, reply, { attachments });
         const drafts = args.drafts_mailbox ?? (await findSpecialUse(client, '\\Drafts'))?.path;
         if (!drafts) throw new ToolError('No Drafts mailbox found. Pass drafts_mailbox explicitly.');
         const result = await client.append(drafts, raw, ['\\Draft', '\\Seen']);
@@ -418,9 +463,99 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
           action: 'save_draft',
           summary: `Draft saved: "${subject}"`,
           mailbox: drafts,
-          details: { to: envelope.to, uid: result.uid, messageId, inReplyTo: reply?.messageId },
+          details: { to: envelope.to, uid: result.uid, messageId, inReplyTo: reply?.messageId, attachments: attachmentNames },
         });
-        return json({ savedTo: drafts, uid: result.uid, messageId, ...log });
+        return json({ savedTo: drafts, uid: result.uid, messageId, attachments: attachmentNames, ...log });
+      });
+    }),
+  );
+
+  server.registerTool(
+    'forward_messages',
+    {
+      title: 'Forward messages as draft',
+      description:
+        'Creates a forward of one or more messages and stores it in the Drafts mailbox (it is not sent). The original ' +
+        'text and ALL original attachments (including PDFs and inline images) are copied on the server, so nothing has ' +
+        'to be transferred through the conversation. mode "inline" (default) quotes the original below your note; ' +
+        'mode "attachment" attaches each original as .eml file.' + logNote,
+      inputSchema: {
+        account: accountArg,
+        mailbox: mailboxArg,
+        uids: z.array(z.number().int().positive()).min(1).max(20).describe('Messages to forward (UIDs in mailbox).'),
+        to: addressList,
+        cc: addressList,
+        bcc: addressList,
+        note: z.string().optional().describe('Your text above the forwarded message(s).'),
+        subject: z.string().optional().describe('Defaults to "Fwd: <original subject>".'),
+        mode: z.enum(['inline', 'attachment']).default('inline'),
+        attach_from_messages: composeSchema.attach_from_messages,
+        drafts_mailbox: z.string().optional().describe('Overrides the auto-detected Drafts mailbox.'),
+      },
+      annotations: { ...WRITE, idempotentHint: false },
+    },
+    handler(async (args) => {
+      accounts.assertWritable(args.account);
+      return accounts.withClient(args.account, async (client, account) => {
+        audit.assertNotLogFolder(client, args.drafts_mailbox);
+        const budget = new ByteBudget();
+        const asAttachment = args.mode === 'attachment';
+        const sources = [];
+        for (const uid of args.uids) sources.push(await loadForwardSource(client, args.mailbox, uid, asAttachment, budget));
+        const extraAttachments = await loadAttachmentRefs(client, args.attach_from_messages ?? [], budget);
+
+        const attachments = sources.flatMap((s) =>
+          s.raw
+            ? [
+                {
+                  filename: `${(s.envelope.subject || 'message').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80)}.eml`,
+                  content: s.raw,
+                  contentType: 'message/rfc822',
+                },
+              ]
+            : s.attachments,
+        );
+        const bodies = forwardBodies(args.note, sources);
+        const { raw, messageId, subject, attachmentNames, envelope } = await buildMessage(
+          account,
+          { to: args.to, cc: args.cc, bcc: args.bcc, subject: args.subject ?? forwardSubject(sources) },
+          undefined,
+          {
+            text: bodies.text,
+            html: bodies.html,
+            attachments: [...attachments, ...extraAttachments],
+            references: sources.length === 1 ? [sources[0].references, sources[0].messageId].filter(Boolean).join(' ') || undefined : undefined,
+          },
+        );
+        const drafts = args.drafts_mailbox ?? (await findSpecialUse(client, '\\Drafts'))?.path;
+        if (!drafts) throw new ToolError('No Drafts mailbox found. Pass drafts_mailbox explicitly.');
+        const result = await client.append(drafts, raw, ['\\Draft', '\\Seen']);
+        if (!result) throw new ToolError('Saving the forward draft failed.');
+
+        const lock = await client.getMailboxLock(args.mailbox, { readOnly: true });
+        let messages;
+        try {
+          messages = await describeMessages(client, args.uids);
+        } finally {
+          lock.release();
+        }
+        const log = await audit.write(client, account, {
+          action: 'forward_messages',
+          summary: `Forward draft saved: "${subject}" (${sources.length} message(s), ${attachmentNames.length} attachment(s))`,
+          mailbox: args.mailbox,
+          messages,
+          details: { to: envelope.to, mode: args.mode, draftsMailbox: drafts, uid: result.uid, attachments: attachmentNames },
+        });
+        return json({
+          savedTo: drafts,
+          uid: result.uid,
+          messageId,
+          subject,
+          to: envelope.to,
+          attachments: attachmentNames,
+          sizeBytes: raw.length,
+          ...log,
+        });
       });
     }),
   );
@@ -451,7 +586,8 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
 
       return accounts.withClient(args.account, async (client) => {
         const reply = args.reply_to_message ? await loadReplyContext(client, args.reply_to_message) : undefined;
-        const { raw, envelope, messageId, subject } = await buildMessage(account, args, reply);
+        const attachments = await loadAttachmentRefs(client, args.attach_from_messages ?? [], new ByteBudget());
+        const { raw, envelope, messageId, subject, attachmentNames } = await buildMessage(account, args, reply, { attachments });
         if (!envelope.to?.length) throw new ToolError('At least one recipient is required.');
 
         const transport = nodemailer.createTransport({
@@ -498,6 +634,7 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
             accepted: info.accepted,
             rejected: info.rejected,
             savedTo,
+            attachments: attachmentNames,
           },
         });
         return json({

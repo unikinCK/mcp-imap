@@ -15,6 +15,8 @@ const host = process.env.IMAP_TEST_HOST;
 const imapPort = process.env.IMAP_TEST_PORT ?? '3143';
 const smtpPort = process.env.SMTP_TEST_PORT ?? '3025';
 const user = `test-${Date.now()}@example.com`;
+// Binary attachment with every byte value, to check that forwarding copies files byte-exact.
+const BINARY = Buffer.from(Array.from({ length: 4096 }, (_, i) => (i * 7) % 256));
 const serverPath = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 
 const WRITE_TOOLS = [
@@ -26,6 +28,7 @@ const WRITE_TOOLS = [
   'rename_mailbox',
   'delete_mailbox',
   'save_draft',
+  'forward_messages',
   'send_email',
 ];
 
@@ -75,7 +78,10 @@ async function seed() {
     to: user,
     subject: 'Report with attachment',
     html: '<p>See the <b>report</b> attached.</p>',
-    attachments: [{ filename: 'report.txt', content: 'quarterly numbers' }],
+    attachments: [
+      { filename: 'report.txt', content: 'quarterly numbers' },
+      { filename: 'data.bin', content: BINARY, contentType: 'application/octet-stream' },
+    ],
   });
   await transport.sendMail({
     from: 'Carol <carol@example.com>',
@@ -117,8 +123,9 @@ describe('integration', { skip: !host && 'IMAP_TEST_HOST not set' }, () => {
 
       const msg = await callJson(client, 'get_message', { uid });
       assert.match(msg.body.text, /See the report attached/i);
-      assert.equal(msg.attachments.length, 1);
+      assert.equal(msg.attachments.length, 2);
       assert.equal(msg.attachments[0].filename, 'report.txt');
+      assert.equal(msg.attachments[1].filename, 'data.bin');
 
       const att = await call(client, 'get_attachment', { uid, part: msg.attachments[0].part });
       assert.equal(att.content[1].text, 'quarterly numbers');
@@ -211,6 +218,56 @@ describe('integration', { skip: !host && 'IMAP_TEST_HOST not set' }, () => {
       }
     });
 
+    test('forwards a message with all attachments as draft', async () => {
+      const { messages } = await callJson(client, 'search_messages', { subject: 'Report with attachment' });
+      const uid = messages[0].uid;
+      const fwd = await callJson(client, 'forward_messages', {
+        uids: [uid],
+        to: 'Larissa <larissa@example.com>',
+        note: 'Hi Larissa,\nsee below.',
+      });
+      assert.equal(fwd.savedTo, 'Drafts');
+      assert.equal(fwd.subject, 'Fwd: Report with attachment');
+      assert.deepEqual(fwd.attachments, ['report.txt', 'data.bin']);
+
+      const draft = await callJson(client, 'get_message', { mailbox: 'Drafts', uid: fwd.uid });
+      assert.deepEqual(draft.to, ['Larissa <larissa@example.com>']);
+      assert.match(draft.body.text, /^Hi Larissa,\nsee below\./);
+      assert.match(draft.body.text, /---------- Forwarded message ----------\nFrom: Bob <bob@example\.com>/);
+      assert.match(draft.body.text, /See the report attached/);
+      assert.ok(draft.flags.includes('\\Draft'));
+      const [txt, bin] = draft.attachments;
+      assert.equal((await call(client, 'get_attachment', { mailbox: 'Drafts', uid: fwd.uid, part: txt.part })).content[1].text, 'quarterly numbers');
+      const binary = await call(client, 'get_attachment', { mailbox: 'Drafts', uid: fwd.uid, part: bin.part });
+      assert.ok(Buffer.from(binary.content[1].resource.blob, 'base64').equals(BINARY), 'binary attachment must be byte-exact');
+
+      // Forward as .eml attachment, plus a single attachment of another message
+      const question = (await callJson(client, 'search_messages', { subject: 'Question' })).messages[0];
+      const report = await callJson(client, 'get_message', { uid });
+      const eml = await callJson(client, 'forward_messages', {
+        uids: [question.uid],
+        mode: 'attachment',
+        attach_from_messages: [{ uid, part: report.attachments[0].part }],
+      });
+      assert.deepEqual(eml.attachments, ['Question.eml', 'report.txt']);
+      const emlDraft = await callJson(client, 'get_message', { mailbox: 'Drafts', uid: eml.uid });
+      assert.equal(emlDraft.attachments[0].contentType, 'message/rfc822');
+
+      // save_draft can reuse attachments of existing messages
+      const withAttachment = await callJson(client, 'save_draft', {
+        to: 'larissa@example.com',
+        subject: 'Calendar',
+        text: 'See attachment',
+        attach_from_messages: [{ uid }],
+      });
+      assert.deepEqual(withAttachment.attachments, ['report.txt', 'data.bin']);
+
+      const log = await callJson(client, 'list_messages', { mailbox: 'MCP Log', limit: 100 });
+      assert.ok(
+        log.messages.some((m) => m.subject === '[mcp-imap] Forward draft saved: "Fwd: Report with attachment" (1 message(s), 2 attachment(s))'),
+      );
+    });
+
     test('saves a threaded reply draft', async () => {
       const { messages } = await callJson(client, 'search_messages', { subject: 'Question' });
       const draft = await callJson(client, 'save_draft', {
@@ -249,7 +306,7 @@ describe('integration', { skip: !host && 'IMAP_TEST_HOST not set' }, () => {
 
     test('exposes no delete or send tools', async () => {
       const names = (await client.listTools()).tools.map((t) => t.name);
-      for (const t of ['update_flags', 'move_messages', 'copy_messages', 'create_mailbox', 'rename_mailbox', 'save_draft']) {
+      for (const t of ['update_flags', 'move_messages', 'copy_messages', 'create_mailbox', 'rename_mailbox', 'save_draft', 'forward_messages']) {
         assert.ok(names.includes(t), `${t} must be exposed`);
       }
       for (const t of ['delete_messages', 'delete_mailbox', 'send_email']) {
