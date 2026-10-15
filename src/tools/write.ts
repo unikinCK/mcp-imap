@@ -5,7 +5,7 @@ import nodemailer from 'nodemailer';
 import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 import type Mail from 'nodemailer/lib/mailer/index.js';
 import { z } from 'zod';
-import type { AccountConfig, ServerConfig } from '../config.js';
+import type { AccountConfig, ServerConfig, SmtpSettings } from '../config.js';
 import { AuditLog, describeMessages } from '../audit.js';
 import {
   type AttachmentRef,
@@ -15,6 +15,7 @@ import {
   loadAttachmentRefs,
   loadForwardSource,
 } from '../forward.js';
+import { ownAddresses, replyBodies, replyRecipients, replySubject } from '../reply.js';
 import { type AccountManager, findSpecialUse, ToolError } from '../imap.js';
 import { formatAddresses, parseHeaders } from '../messages.js';
 import { accountArg, handler, json, mailboxArg, uidsArg } from './common.js';
@@ -187,6 +188,54 @@ async function buildMessage(account: AccountConfig, args: ComposeArgs, reply?: R
     subject: options.subject as string,
     attachmentNames,
   };
+}
+
+/**
+ * Sends a composed message via SMTP, stores a copy in Sent (optional) and flags the answered
+ * original. Used by send_email and reply_message.
+ */
+async function deliver(
+  client: ImapFlow,
+  smtp: SmtpSettings,
+  raw: Buffer,
+  envelope: { from: string | false; to: string[] },
+  saveToSent: boolean,
+  answered?: { mailbox: string; uid: number },
+) {
+  const transport = nodemailer.createTransport({
+    host: smtp.host,
+    port: smtp.port,
+    secure: smtp.secure,
+    auth: smtp.user ? { user: smtp.user, pass: smtp.password ?? '' } : undefined,
+    tls: { rejectUnauthorized: smtp.tlsRejectUnauthorized },
+  });
+  let info;
+  try {
+    info = await transport.sendMail({ envelope: { from: envelope.from || undefined, to: envelope.to }, raw });
+  } finally {
+    transport.close();
+  }
+
+  let savedTo: string | undefined;
+  let saveError: string | undefined;
+  if (saveToSent) {
+    try {
+      const sent = (await findSpecialUse(client, '\\Sent'))?.path;
+      if (sent && (await client.append(sent, raw, ['\\Seen']))) savedTo = sent;
+      else saveError = 'No Sent mailbox found.';
+    } catch (err) {
+      saveError = (err as Error).message;
+    }
+  }
+  if (answered) {
+    const lock = await client.getMailboxLock(answered.mailbox);
+    try {
+      await client.messageFlagsAdd(String(answered.uid), ['\\Answered'], { uid: true });
+    } finally {
+      lock.release();
+    }
+  }
+  return { info, savedTo, saveError };
 }
 
 const WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } as const;
@@ -560,6 +609,131 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
     }),
   );
 
+  const toList = (value?: string | string[]) => (value === undefined ? [] : Array.isArray(value) ? value : [value]);
+  const anySend = accounts.list().some((a) => accounts.canSend(a.name));
+
+  server.registerTool(
+    'reply_message',
+    {
+      title: 'Reply to a message',
+      description:
+        'Replies to a message like a mail client: recipient from Reply-To/From (reply_all adds To and Cc without your ' +
+        'own addresses), subject "Re: ...", threading headers, and the original quoted below your text. By default ' +
+        'the reply is stored as draft in Drafts.' +
+        (anySend
+          ? ' With send=true it is sent immediately (confirm recipients and content with the user first), stored in Sent and the original is flagged as answered.'
+          : ' Sending is not permitted, so replies are always saved as drafts.') +
+        logNote,
+      inputSchema: {
+        account: accountArg,
+        mailbox: mailboxArg,
+        uid: z.number().int().positive().describe('UID of the message to reply to.'),
+        text: z.string().optional().describe('Your reply (plain text). Either text or html is required.'),
+        html: z.string().optional().describe('Your reply as HTML (optional).'),
+        reply_all: z.boolean().default(false).describe('Also reply to all other To and Cc recipients.'),
+        to: addressList.describe('Additional To recipients.'),
+        cc: addressList.describe('Additional Cc recipients.'),
+        bcc: addressList,
+        subject: z.string().optional().describe('Defaults to "Re: <original subject>".'),
+        quote: z.boolean().default(true).describe('Quote the original message below the reply.'),
+        language: z
+          .enum(['en', 'de'])
+          .default('en')
+          .describe('Language of the quote header ("On ... wrote:" / "Am ... schrieb ...:"); use the language of the reply.'),
+        include_attachments: z.boolean().default(false).describe('Attach the attachments of the original message.'),
+        attach_from_messages: composeSchema.attach_from_messages,
+        send: z.boolean().default(false).describe('Send immediately instead of saving a draft (needs send permission).'),
+        save_to_sent: z.boolean().optional().describe('When sending: store a copy in Sent (default from account config).'),
+        drafts_mailbox: z.string().optional().describe('Overrides the auto-detected Drafts mailbox.'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    handler(async (args) => {
+      if (args.send) accounts.assertCanSend(args.account);
+      else accounts.assertWritable(args.account);
+      if (!args.text && !args.html) throw new ToolError('Either text or html is required.');
+      return accounts.withClient(args.account, async (client, account) => {
+        audit.assertNotLogFolder(client, args.drafts_mailbox);
+        const budget = new ByteBudget();
+        const attachmentMode = args.include_attachments ? 'all' : args.quote ? 'inline' : 'none';
+        const source = await loadForwardSource(client, args.mailbox, args.uid, false, budget, attachmentMode);
+        const extraAttachments = await loadAttachmentRefs(client, args.attach_from_messages ?? [], budget);
+
+        const recipients = replyRecipients(source.envelope, ownAddresses(account), args.reply_all);
+        const to = [...recipients.to, ...toList(args.to)];
+        const cc = [...recipients.cc, ...toList(args.cc)];
+        if (!to.length && args.send) throw new ToolError('Could not determine a recipient. Pass "to" explicitly.');
+        const bodies = args.quote ? replyBodies(args.text, args.html, source, args.language) : { text: args.text, html: args.html };
+        const reply = {
+          mailbox: args.mailbox,
+          uid: args.uid,
+          messageId: source.messageId,
+          references: source.references,
+          subject: source.envelope.subject,
+        };
+        const { raw, envelope, messageId, subject, attachmentNames } = await buildMessage(
+          account,
+          { to, cc: cc.length ? cc : undefined, bcc: args.bcc, subject: args.subject ?? replySubject(source.envelope.subject) },
+          reply,
+          { text: bodies.text ?? '', html: bodies.html, attachments: [...source.attachments, ...extraAttachments] },
+        );
+        const messages = [
+          {
+            uid: args.uid,
+            date: source.envelope.date ? new Date(source.envelope.date).toISOString().slice(0, 16).replace('T', ' ') : undefined,
+            from: source.envelope.from?.map((a) => a.address).join(', '),
+            subject: source.envelope.subject,
+          },
+        ];
+
+        if (args.send) {
+          const smtp = account.smtp!;
+          const { info, savedTo, saveError } = await deliver(
+            client,
+            smtp,
+            raw,
+            envelope,
+            args.save_to_sent ?? smtp.saveToSent,
+            reply,
+          );
+          const log = await audit.write(client, account, {
+            action: 'reply_message',
+            summary: `Reply sent: "${subject}" to ${envelope.to.join(', ')}`,
+            mailbox: args.mailbox,
+            messages,
+            details: { recipients: envelope.to, messageId, accepted: info.accepted, rejected: info.rejected, savedTo, attachments: attachmentNames },
+          });
+          return json({
+            sent: true,
+            messageId,
+            subject,
+            to,
+            cc,
+            accepted: info.accepted,
+            rejected: info.rejected,
+            savedTo,
+            ...(saveError ? { saveError } : {}),
+            attachments: attachmentNames,
+            ...log,
+          });
+        }
+
+        const drafts = args.drafts_mailbox ?? (await findSpecialUse(client, '\\Drafts'))?.path;
+        if (!drafts) throw new ToolError('No Drafts mailbox found. Pass drafts_mailbox explicitly.');
+        const result = await client.append(drafts, raw, ['\\Draft', '\\Seen']);
+        if (!result) throw new ToolError('Saving the reply draft failed.');
+        const log = await audit.write(client, account, {
+          action: 'reply_message',
+          summary: `Reply draft saved: "${subject}"${to.length ? ` to ${to.join(', ')}` : ''}`,
+          mailbox: args.mailbox,
+          messages,
+          details: { to, cc, draftsMailbox: drafts, uid: result.uid, messageId, attachments: attachmentNames },
+        });
+        return json({ sent: false, savedTo: drafts, uid: result.uid, messageId, subject, to, cc, attachments: attachmentNames, ...log });
+      });
+    }),
+  );
+
   if (accounts.list().some((a) => accounts.canDelete(a.name))) registerDeleteTools(server, accounts, audit, logNote);
 
   if (!accounts.list().some((a) => accounts.canSend(a.name))) return;
@@ -590,39 +764,14 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
         const { raw, envelope, messageId, subject, attachmentNames } = await buildMessage(account, args, reply, { attachments });
         if (!envelope.to?.length) throw new ToolError('At least one recipient is required.');
 
-        const transport = nodemailer.createTransport({
-          host: smtp.host,
-          port: smtp.port,
-          secure: smtp.secure,
-          auth: smtp.user ? { user: smtp.user, pass: smtp.password ?? '' } : undefined,
-          tls: { rejectUnauthorized: smtp.tlsRejectUnauthorized },
-        });
-        let info;
-        try {
-          info = await transport.sendMail({ envelope, raw });
-        } finally {
-          transport.close();
-        }
-
-        let savedTo: string | undefined;
-        let saveError: string | undefined;
-        if (args.save_to_sent ?? smtp.saveToSent) {
-          try {
-            const sent = (await findSpecialUse(client, '\\Sent'))?.path;
-            if (sent && (await client.append(sent, raw, ['\\Seen']))) savedTo = sent;
-            else saveError = 'No Sent mailbox found.';
-          } catch (err) {
-            saveError = (err as Error).message;
-          }
-        }
-        if (reply) {
-          const lock = await client.getMailboxLock(reply.mailbox);
-          try {
-            await client.messageFlagsAdd(String(reply.uid), ['\\Answered'], { uid: true });
-          } finally {
-            lock.release();
-          }
-        }
+        const { info, savedTo, saveError } = await deliver(
+          client,
+          smtp,
+          raw,
+          envelope,
+          args.save_to_sent ?? smtp.saveToSent,
+          reply,
+        );
         const log = await audit.write(client, account, {
           action: 'send_email',
           summary: `Sent: "${subject}" to ${envelope.to.join(', ')}`,

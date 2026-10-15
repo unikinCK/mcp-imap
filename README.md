@@ -176,7 +176,7 @@ Server     ──(5) loads the user's encrypted mail accounts, talks IMAP/SMTP
 | Scope | Grants |
 | --- | --- |
 | `mail:read` | All read tools (always granted) |
-| `mail:organize` | Flag, copy, verified move, create/rename folders, drafts and forward drafts – nothing is deleted |
+| `mail:organize` | Flag, copy, verified move, create/rename folders, drafts, reply and forward drafts – nothing is deleted |
 | `mail:delete` | `delete_messages`, `delete_mailbox` (implies `mail:organize`) |
 | `mail:send` | `send_email` (implies `mail:organize`) |
 | `mail:write` | Legacy scope from v0.2.0, still accepted: `mail:organize` + `mail:delete` |
@@ -293,10 +293,11 @@ The commands use `MCP_IMAP_DB`; they do not need the secret key.
 | `create_mailbox` / `rename_mailbox` | Folder management (INBOX and the log folder are protected) |
 | `delete_mailbox` | Delete a folder – only with delete permission |
 | `save_draft` | Compose a message (optionally as a reply, with attachments) and store it in Drafts |
+| `reply_message` | Reply like a mail client: recipient from Reply-To/From, `reply_all` (without your own addresses), `Re:` subject, threading headers, original quoted below (`>` / blockquote, header in English or German), optionally with the original attachments. Saved as draft by default; `send: true` sends it (needs send permission) and flags the original as answered |
 | `forward_messages` | Forward one or more messages as a draft in Drafts – inline with all original attachments (incl. inline images) or as `.eml` attachment. Everything is copied on the server, so large PDFs work too |
 | `send_email` | Send via SMTP, store a copy in Sent, flag the original as answered when replying. Only available if SMTP is configured and sending is not disabled |
 
-`save_draft`, `send_email` and `forward_messages` accept `attach_from_messages` (`[{ mailbox, uid, part? }]`) to reuse attachments of existing messages – copied on the server (max. 25 MB per draft), without passing file contents through the conversation.
+`save_draft`, `send_email`, `reply_message` and `forward_messages` accept `attach_from_messages` (`[{ mailbox, uid, part? }]`) to reuse attachments of existing messages – copied on the server (max. 25 MB per draft), without passing file contents through the conversation.
 
 All tools take an optional `account` argument; without it, the first configured account is used. Messages are addressed by their IMAP **UID** within a mailbox.
 

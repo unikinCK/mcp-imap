@@ -29,6 +29,7 @@ const WRITE_TOOLS = [
   'delete_mailbox',
   'save_draft',
   'forward_messages',
+  'reply_message',
   'send_email',
 ];
 
@@ -87,6 +88,7 @@ async function seed() {
     from: 'Carol <carol@example.com>',
     replyTo: 'carol-replies@example.com',
     to: user,
+    cc: 'Dave <dave@example.com>',
     subject: 'Question',
     text: 'Can you answer this?',
   });
@@ -268,6 +270,45 @@ describe('integration', { skip: !host && 'IMAP_TEST_HOST not set' }, () => {
       );
     });
 
+    test('replies with quote, reply all, HTML and attachments', async () => {
+      const question = (await callJson(client, 'search_messages', { subject: 'Question' })).messages[0];
+
+      const draft = await callJson(client, 'reply_message', { uid: question.uid, text: 'Hallo Carol,\nja.', language: 'de' });
+      assert.equal(draft.sent, false);
+      assert.equal(draft.subject, 'Re: Question');
+      assert.deepEqual(draft.to, ['carol-replies@example.com']);
+      assert.deepEqual(draft.cc, []);
+      const saved = await callJson(client, 'get_message', { mailbox: 'Drafts', uid: draft.uid });
+      assert.equal(saved.inReplyTo, question.messageId);
+      assert.match(saved.body.text, /^Hallo Carol,\nja\.\n\nAm .+ schrieb Carol <carol@example\.com>:\n> Can you answer this\?/);
+
+      const all = await callJson(client, 'reply_message', { uid: question.uid, text: 'To everyone', reply_all: true });
+      assert.deepEqual(all.to, ['carol-replies@example.com']);
+      assert.deepEqual(all.cc, ['Dave <dave@example.com>'], 'own address must not be included');
+      const allSaved = await callJson(client, 'get_message', { mailbox: 'Drafts', uid: all.uid });
+      assert.match(allSaved.body.text, /On .+ UTC, Carol <carol@example\.com> wrote:/);
+
+      const report = (await callJson(client, 'search_messages', { subject: 'Report with attachment' })).messages[0];
+      const htmlReply = await callJson(client, 'reply_message', { uid: report.uid, text: 'Thanks!', include_attachments: true });
+      assert.deepEqual(htmlReply.attachments, ['report.txt', 'data.bin']);
+      const htmlSaved = await callJson(client, 'get_message', { mailbox: 'Drafts', uid: htmlReply.uid, format: 'both' });
+      assert.match(htmlSaved.body.html, /<blockquote[^>]*>.*See the <b>report<\/b> attached/s);
+      assert.match(htmlSaved.body.text, /^Thanks!\n\nOn .+ wrote:\n> See the report attached\./);
+
+      const log = await callJson(client, 'list_messages', { mailbox: 'MCP Log', limit: 100 });
+      assert.ok(log.messages.some((m) => m.subject === '[mcp-imap] Reply draft saved: "Re: Question" to carol-replies@example.com'));
+    });
+
+    test('sends a reply directly when send=true', async () => {
+      const question = (await callJson(client, 'search_messages', { subject: 'Question' })).messages[0];
+      const sent = await callJson(client, 'reply_message', { uid: question.uid, text: 'Sent answer', send: true });
+      assert.equal(sent.sent, true);
+      assert.deepEqual(sent.accepted, ['carol-replies@example.com']);
+      assert.equal(sent.savedTo, 'Sent');
+      const answered = await callJson(client, 'search_messages', { answered: true, subject: 'Question' });
+      assert.equal(answered.totalMatches, 1);
+    });
+
     test('saves a threaded reply draft', async () => {
       const { messages } = await callJson(client, 'search_messages', { subject: 'Question' });
       const draft = await callJson(client, 'save_draft', {
@@ -306,7 +347,7 @@ describe('integration', { skip: !host && 'IMAP_TEST_HOST not set' }, () => {
 
     test('exposes no delete or send tools', async () => {
       const names = (await client.listTools()).tools.map((t) => t.name);
-      for (const t of ['update_flags', 'move_messages', 'copy_messages', 'create_mailbox', 'rename_mailbox', 'save_draft', 'forward_messages']) {
+      for (const t of ['update_flags', 'move_messages', 'copy_messages', 'create_mailbox', 'rename_mailbox', 'save_draft', 'forward_messages', 'reply_message']) {
         assert.ok(names.includes(t), `${t} must be exposed`);
       }
       for (const t of ['delete_messages', 'delete_mailbox', 'send_email']) {
@@ -315,6 +356,15 @@ describe('integration', { skip: !host && 'IMAP_TEST_HOST not set' }, () => {
       const info = await callJson(client, 'list_accounts', {});
       assert.equal(info.accounts[0].canDelete, false);
       assert.equal(info.accounts[0].canSend, false);
+    });
+
+    test('replies only as draft without send permission', async () => {
+      const question = (await callJson(client, 'search_messages', { subject: 'Question' })).messages[0];
+      const result = await client.callTool({ name: 'reply_message', arguments: { uid: question.uid, text: 'x', send: true } });
+      assert.ok(result.isError);
+      assert.match(result.content[0].text, /Sending is not permitted/);
+      const draft = await callJson(client, 'reply_message', { uid: question.uid, text: 'Draft only' });
+      assert.equal(draft.sent, false);
     });
 
     test('moves as verified copy, but never to Trash', async () => {

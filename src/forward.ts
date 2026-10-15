@@ -95,12 +95,14 @@ export async function loadForwardSource(
   uid: number,
   asAttachment: boolean,
   budget: ByteBudget,
+  /** all = every attachment; inline = only inline images referenced by the HTML (for quoting); none */
+  attachmentMode: 'all' | 'inline' | 'none' = 'all',
 ): Promise<ForwardSource> {
   const lock = await client.getMailboxLock(mailbox, { readOnly: true });
   try {
     const msg = await client.fetchOne(
       String(uid),
-      { uid: true, envelope: true, bodyStructure: true, size: true, headers: ['references'] },
+      { uid: true, envelope: true, bodyStructure: true, size: true, headers: ['references', 'reply-to'] },
       { uid: true },
     );
     if (!msg) throw new ToolError(`Message UID ${uid} not found in "${mailbox}".`);
@@ -122,7 +124,12 @@ export async function loadForwardSource(
     const text = structure.text ? (await downloadPart(client, uid, structure.text.part!)).data.toString('utf8') : undefined;
     const html = structure.html ? (await downloadPart(client, uid, structure.html.part!)).data.toString('utf8') : undefined;
     const attachments: Mail.Attachment[] = [];
-    for (const a of structure.attachments) {
+    const wanted = structure.attachments.filter((a) => {
+      if (attachmentMode === 'all') return true;
+      if (attachmentMode === 'none') return false;
+      return Boolean(html && a.contentId && a.disposition !== 'attachment');
+    });
+    for (const a of wanted) {
       attachments.push(await downloadAttachment(client, uid, a.part, budget, a));
     }
     return { ...base, text, html, attachments };
@@ -131,7 +138,7 @@ export async function loadForwardSource(
   }
 }
 
-function escapeHtml(value: string): string {
+export function escapeHtml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
@@ -151,7 +158,7 @@ function headerLines(env: MessageEnvelopeObject): [string, string][] {
 const SEPARATOR = '---------- Forwarded message ----------';
 
 /** Extracts the inner part of <body> so that the original HTML can be embedded. */
-function bodyOf(html: string): string {
+export function bodyOf(html: string): string {
   return /<body[^>]*>([\s\S]*)<\/body>/i.exec(html)?.[1] ?? html;
 }
 
