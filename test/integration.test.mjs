@@ -5,11 +5,16 @@
 //     greenmail/standalone:2.1.14
 //   IMAP_TEST_HOST=localhost npm test
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, readdirSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import nodemailer from 'nodemailer';
+import { makeDocx, makePdf, makeXlsx } from './fixtures.mjs';
 
 const host = process.env.IMAP_TEST_HOST;
 const imapPort = process.env.IMAP_TEST_PORT ?? '3143';
@@ -33,7 +38,7 @@ const WRITE_TOOLS = [
   'send_email',
 ];
 
-async function startClient(args) {
+async function startClient(args, { mailUser = user, env = {} } = {}) {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [serverPath, ...args],
@@ -42,12 +47,13 @@ async function startClient(args) {
       IMAP_HOST: host,
       IMAP_PORT: imapPort,
       IMAP_SECURE: 'false',
-      IMAP_USER: user,
+      IMAP_USER: mailUser,
       IMAP_PASSWORD: 'secret',
       SMTP_HOST: host,
       SMTP_PORT: smtpPort,
       SMTP_SECURE: 'false',
-      SMTP_FROM: `Test User <${user}>`,
+      SMTP_FROM: `Test User <${mailUser}>`,
+      ...env,
     },
     stderr: 'ignore',
   });
@@ -385,6 +391,139 @@ describe('integration', { skip: !host && 'IMAP_TEST_HOST not set' }, () => {
       assert.ok(toTrash.isError);
       assert.match(toTrash.content[0].text, /counts as deleting/);
       assert.equal((await callJson(client, 'search_messages', { mailbox: 'Archive', subject: 'Report with attachment' })).totalMatches, 1);
+    });
+  });
+
+  describe('attachments as text', () => {
+    const docsUser = `docs-${Date.now()}@example.com`;
+    const downloadDir = mkdtempSync(join(tmpdir(), 'mcp-imap-save-'));
+    const invoice = makePdf([
+      { lines: ['Bio-Hotel Land Gut Hoehne', 'Rechnung AR-0000-635976', 'Rechnungsadresse: unikin GmbH, Musterstraße 1'] },
+      { lines: ['Seite zwei der Rechnung', 'Gesamtbetrag 412,00 EUR'] },
+      { lines: ['Seite drei mit Zahlungsbedingungen'] },
+    ]);
+    let client;
+    let uid;
+    let msg;
+    const byName = (name) => msg.attachments.find((a) => a.filename === name);
+
+    before(async () => {
+      const transport = nodemailer.createTransport({ host, port: Number(smtpPort), secure: false, ignoreTLS: true });
+      await transport.sendMail({
+        from: 'Hotel <reservierung@example.com>',
+        to: docsUser,
+        subject: 'Ihr Rechnungsdokument',
+        text: 'Im Anhang übersenden wir Ihnen hiermit Ihre Rechnung.',
+        attachments: [
+          // Many mail programs label PDFs as application/octet-stream.
+          { filename: 'AR-0000-635976.pdf', content: invoice, contentType: 'application/octet-stream' },
+          { filename: 'Angebot.docx', content: await makeDocx(['Angebot 260916', 'Wartung Klimaanlage']) },
+          { filename: 'Positionen.xlsx', content: await makeXlsx({ Positionen: [['Artikel', 'Preis'], ['Übernachtung', 189.5]] }) },
+          { filename: 'archive.zip', content: Buffer.from('PK\x05\x06' + '\0'.repeat(18), 'latin1'), contentType: 'application/zip' },
+        ],
+      });
+      transport.close();
+      await new Promise((r) => setTimeout(r, 500));
+      client = await startClient(['--read-only'], { mailUser: docsUser, env: { MCP_IMAP_DOWNLOAD_DIR: downloadDir } });
+      uid = (await callJson(client, 'search_messages', { subject: 'Rechnungsdokument' })).messages[0].uid;
+      msg = await callJson(client, 'get_message', { uid });
+    });
+    after(async () => client?.close());
+
+    test('get_message lists attachments with text availability and resource URIs', async () => {
+      const result = await call(client, 'get_message', { uid });
+      assert.equal(result.structuredContent.uid, uid, 'get_message returns structured content');
+      const pdf = byName('AR-0000-635976.pdf');
+      assert.equal(pdf.textAvailable, true);
+      assert.equal(pdf.resourceUri, `imap://default/INBOX/${uid}/${pdf.part}`);
+      assert.equal(byName('archive.zip').textAvailable, false);
+      assert.equal(pdf.downloadUrl, undefined, 'download links only exist in the HTTP server');
+    });
+
+    test('returns a PDF as text with page markers and structured content', async () => {
+      const result = await call(client, 'get_attachment', { uid, part: byName('AR-0000-635976.pdf').part });
+      const info = result.structuredContent;
+      assert.equal(info.kind, 'pdf');
+      assert.equal(info.contentType, 'application/pdf');
+      assert.equal(info.format, 'text');
+      assert.equal(info.textInfo.method, 'pdf-text-layer');
+      assert.equal(info.textInfo.totalPages, 3);
+      assert.match(info.text, /Rechnungsadresse: unikin GmbH, Musterstraße 1/);
+      assert.equal(result.content[1].text, info.text, 'the text is also a plain text block for every client');
+      assert.equal(JSON.parse(result.content[0].text).text, undefined);
+    });
+
+    test('selects pages and pages through long text', async () => {
+      const part = byName('AR-0000-635976.pdf').part;
+      const page2 = (await call(client, 'get_attachment', { uid, part, pages: '2' })).structuredContent;
+      assert.deepEqual(page2.textInfo.pages, [2]);
+      assert.match(page2.text, /^--- Page 2 of 3 ---\nSeite zwei/);
+      assert.doesNotMatch(page2.text, /Rechnungsadresse/);
+
+      const first = await call(client, 'get_attachment', { uid, part, max_chars: 40 });
+      assert.equal(first.structuredContent.text.length, 40);
+      assert.equal(first.structuredContent.textInfo.nextOffset, 40);
+      assert.match(first.content[1].text, /continue with offset 40/);
+      const next = (await call(client, 'get_attachment', { uid, part, offset: 40, max_chars: 100000 })).structuredContent;
+      assert.equal(next.textInfo.truncated, false);
+      assert.equal(first.structuredContent.text + next.text, (await call(client, 'get_attachment', { uid, part })).structuredContent.text);
+    });
+
+    test('reads Word and Excel attachments', async () => {
+      const docx = (await call(client, 'get_attachment', { uid, part: byName('Angebot.docx').part })).structuredContent;
+      assert.equal(docx.kind, 'docx');
+      assert.match(docx.text, /Angebot 260916\s+Wartung Klimaanlage/);
+      const xlsx = (await call(client, 'get_attachment', { uid, part: byName('Positionen.xlsx').part })).structuredContent;
+      assert.match(xlsx.text, /Übernachtung\t189.5/);
+    });
+
+    test('falls back to the original file for unknown types, or fails with format "text"', async () => {
+      const part = byName('archive.zip').part;
+      const auto = await call(client, 'get_attachment', { uid, part });
+      assert.equal(auto.structuredContent.format, 'raw');
+      assert.match(auto.structuredContent.warnings[0], /cannot be converted to text/);
+      assert.ok(auto.content.some((c) => c.type === 'resource' && c.resource.blob));
+      assert.ok(auto.content.some((c) => c.type === 'resource_link'));
+      const text = await client.callTool({ name: 'get_attachment', arguments: { uid, part, format: 'text' } });
+      assert.ok(text.isError);
+    });
+
+    test('returns originals, links and rendered pages on request', async () => {
+      const part = byName('AR-0000-635976.pdf').part;
+      const raw = await call(client, 'get_attachment', { uid, part, format: 'raw' });
+      assert.ok(Buffer.from(raw.content[1].resource.blob, 'base64').equals(invoice));
+
+      const link = await call(client, 'get_attachment', { uid, part, format: 'link' });
+      assert.equal(link.structuredContent.format, 'link');
+      assert.equal(link.content[1].type, 'resource_link');
+      assert.equal(link.content[1].uri, byName('AR-0000-635976.pdf').resourceUri);
+
+      const images = await call(client, 'get_attachment', { uid, part, format: 'images', pages: '1-2' });
+      assert.equal(images.structuredContent.images, 2);
+      assert.equal(images.content.filter((c) => c.type === 'image' && c.mimeType === 'image/png').length, 2);
+    });
+
+    test('serves attachments as MCP resources', async () => {
+      const { resourceTemplates } = await client.listResourceTemplates();
+      assert.ok(resourceTemplates.some((t) => t.uriTemplate === 'imap://{account}/{mailbox}/{uid}/{part}'));
+      const pdf = byName('AR-0000-635976.pdf');
+      const { contents } = await client.readResource({ uri: pdf.resourceUri });
+      assert.equal(contents[0].mimeType, 'application/pdf');
+      assert.ok(Buffer.from(contents[0].blob, 'base64').equals(invoice));
+    });
+
+    test('saves attachments into the download directory', async () => {
+      const saved = (await call(client, 'save_attachment', { uid })).structuredContent;
+      assert.deepEqual(saved.files.map((f) => f.filename), ['AR-0000-635976.pdf', 'Angebot.docx', 'Positionen.xlsx', 'archive.zip']);
+      const pdf = saved.files[0];
+      assert.ok(readFileSync(pdf.path).equals(invoice));
+      assert.equal(pdf.sha256, createHash('sha256').update(invoice).digest('hex'));
+
+      const again = (await call(client, 'save_attachment', { uid, parts: [byName('AR-0000-635976.pdf').part] })).structuredContent;
+      assert.equal(again.files[0].filename, 'AR-0000-635976 (1).pdf', 'existing files are not overwritten');
+      const renamed = await call(client, 'save_attachment', { uid, parts: [byName('Angebot.docx').part], filename: '../../evil.docx' });
+      assert.equal(renamed.structuredContent.files[0].path, join(downloadDir, 'evil.docx'));
+      assert.equal(readdirSync(downloadDir).filter((f) => f.endsWith('.partial')).length, 0);
     });
   });
 });

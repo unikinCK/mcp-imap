@@ -15,15 +15,16 @@ export const uidsArg = z
   .max(1000)
   .describe('Message UIDs within the mailbox (as returned by list_messages / search_messages).');
 
+const replacer = (_key: string, value: unknown) => (typeof value === 'bigint' ? value.toString() : value);
+
 export function json(data: unknown): CallToolResult {
-  return {
-    content: [
-      {
-        type: 'text',
-        text: JSON.stringify(data, (_key, value) => (typeof value === 'bigint' ? value.toString() : value), 2),
-      },
-    ],
-  };
+  return { content: [{ type: 'text', text: JSON.stringify(data, replacer, 2) }] };
+}
+
+/** Result for tools with an output schema: the same data as JSON text (for every client) and as structured content. */
+export function structured(data: Record<string, unknown>): CallToolResult {
+  const plain = JSON.parse(JSON.stringify(data, replacer)) as Record<string, unknown>;
+  return { content: [{ type: 'text', text: JSON.stringify(plain, null, 2) }], structuredContent: plain };
 }
 
 function describeError(err: unknown): string {

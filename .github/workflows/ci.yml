@@ -38,3 +38,5 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -t mcp-imap .
       - run: docker run --rm mcp-imap --help
+      - name: Attachment extraction and OCR inside the image
+        run: docker run --rm --entrypoint node -v "$PWD/test:/app/test:ro" mcp-imap --test test/extract.test.mjs

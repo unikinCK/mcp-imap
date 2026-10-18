@@ -11,6 +11,8 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import nodemailer from 'nodemailer';
+import { verifyDownloadToken } from '../dist/http/download.js';
+import { makePdf } from './fixtures.mjs';
 
 const imapHost = process.env.IMAP_TEST_HOST;
 const imapPort = process.env.IMAP_TEST_PORT ?? '3143';
@@ -336,6 +338,66 @@ describe('http server', () => {
     assert.equal(list.messages[0].subject, 'Via HTTP');
     const flagged = await mcp.callTool({ name: 'update_flags', arguments: { uids: [list.messages[0].uid], add: ['flagged'] } });
     assert.ok(!flagged.isError, flagged.content[0].text);
+    await mcp.close();
+  });
+
+  test('attachments: text over HTTP and signed download links', { skip: !imapHost && 'IMAP_TEST_HOST not set' }, async () => {
+    const pdf = makePdf([{ lines: ['Rechnung', 'Rechnungsadresse: unikin GmbH, Musterstraße 1'] }]);
+    const transport = nodemailer.createTransport({ host: imapHost, port: Number(smtpPort), secure: false, ignoreTLS: true });
+    await transport.sendMail({
+      from: 'hotel@example.com',
+      to: mailUser,
+      subject: 'Rechnung via HTTP',
+      text: 'Anbei',
+      attachments: [
+        { filename: 'Rechnung März.pdf', content: pdf },
+        { filename: 'evil.html', content: '<script>alert(1)</script>', contentType: 'text/html' },
+      ],
+    });
+    transport.close();
+    await new Promise((r) => setTimeout(r, 300));
+
+    const tokens = await authorize(browser, client, ['mail:organize']);
+    const mcp = await mcpClient(tokens.access_token);
+    const call = async (name, args) => {
+      const result = await mcp.callTool({ name, arguments: args });
+      assert.ok(!result.isError, result.content[0].text);
+      return result.structuredContent;
+    };
+    const { messages } = JSON.parse((await mcp.callTool({ name: 'search_messages', arguments: { subject: 'Rechnung via HTTP' } })).content[0].text);
+    const msg = await call('get_message', { uid: messages[0].uid });
+    const [att, html] = msg.attachments;
+    assert.ok(msg.downloadExpiresAt);
+    assert.ok(att.downloadUrl.startsWith(`${base}/attachments/`));
+    assert.ok(att.downloadUrl.endsWith('/Rechnung%20M%C3%A4rz.pdf'));
+
+    const text = await call('get_attachment', { uid: msg.uid, part: att.part });
+    assert.match(text.text, /unikin GmbH/);
+    assert.ok(text.downloadUrl);
+
+    // The link works without the OAuth token (e.g. from a code sandbox) and returns the original bytes.
+    const res = await fetch(att.downloadUrl);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'application/pdf');
+    assert.match(res.headers.get('content-disposition'), /filename\*=UTF-8''Rechnung%20M%C3%A4rz\.pdf/);
+    assert.equal(res.headers.get('cache-control'), 'private, no-store');
+    assert.ok(Buffer.from(await res.arrayBuffer()).equals(pdf));
+
+    const htmlRes = await fetch(html.downloadUrl);
+    assert.match(htmlRes.headers.get('content-security-policy'), /sandbox/);
+    assert.equal(htmlRes.headers.get('x-content-type-options'), 'nosniff');
+
+    const token = new URL(att.downloadUrl).pathname.split('/')[2];
+    const [body, mac] = token.split('.');
+    const forged = Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(body, 'base64url')), p: '1' })).toString('base64url');
+    assert.equal((await fetch(`${base}/attachments/${forged}.${mac}`)).status, 404, 'tampered tokens are rejected');
+    assert.equal((await fetch(`${base}/attachments/garbage`)).status, 404);
+    assert.ok(verifyDownloadToken(token, env.MCP_IMAP_SECRET_KEY));
+    assert.equal(verifyDownloadToken(token, env.MCP_IMAP_SECRET_KEY, Date.now() + 3600_000), undefined, 'links expire');
+    assert.equal(verifyDownloadToken(token, 'another secret of at least thirty-two chars'), undefined);
+
+    const log = JSON.parse((await mcp.callTool({ name: 'list_messages', arguments: { mailbox: 'MCP Log', limit: 50 } })).content[0].text);
+    assert.ok(log.messages.some((m) => m.subject === '[mcp-imap] Downloaded attachment Rechnung März.pdf via download link'));
     await mcp.close();
   });
 

@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { type BaseConfig, ConfigError, type Mode } from '../config.js';
+import { type BaseConfig, ConfigError, type ExtractConfig, type Mode } from '../config.js';
 
 export interface HttpConfig {
   mode: Mode;
@@ -18,6 +18,11 @@ export interface HttpConfig {
   refreshTokenTtl: number;
   maxBodyChars: number;
   maxAttachmentBytes: number;
+  extract: ExtractConfig;
+  /** Signed, short-lived download links for attachments (GET /attachments/<token>). */
+  downloadLinks: boolean;
+  /** Validity of a download link in seconds. */
+  downloadTtl: number;
 }
 
 function bool(value: string | undefined, fallback: boolean, name: string): boolean {
@@ -86,5 +91,7 @@ export function loadHttpConfig(
     trustProxy: bool(env.MCP_IMAP_TRUST_PROXY, false, 'MCP_IMAP_TRUST_PROXY'),
     accessTokenTtl: int(env.MCP_IMAP_ACCESS_TOKEN_TTL, 3600, 'MCP_IMAP_ACCESS_TOKEN_TTL'),
     refreshTokenTtl: int(env.MCP_IMAP_REFRESH_TOKEN_TTL, 30 * 24 * 3600, 'MCP_IMAP_REFRESH_TOKEN_TTL'),
+    downloadLinks: bool(env.MCP_IMAP_DOWNLOAD_LINKS, true, 'MCP_IMAP_DOWNLOAD_LINKS'),
+    downloadTtl: int(env.MCP_IMAP_DOWNLOAD_TTL, 600, 'MCP_IMAP_DOWNLOAD_TTL'),
   };
 }

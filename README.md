@@ -87,6 +87,20 @@ General settings:
 | `MCP_IMAP_LOG_FOLDER` | `MCP Log` | Folder for the audit log of all changes; `off` disables it |
 | `MCP_IMAP_MAX_BODY_CHARS` | `50000` | Default maximum length of a returned message body |
 | `MCP_IMAP_MAX_ATTACHMENT_BYTES` | `10485760` | Maximum attachment size returned by `get_attachment` |
+| `MCP_IMAP_DOWNLOAD_DIR` | – | Enables `save_attachment`, which writes attachments into this local directory (stdio only) |
+
+Settings for reading attachments as text (stdio and HTTP):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MCP_IMAP_EXTRACT_TIMEOUT` | `30` | Seconds one PDF / Word / Excel file may take to parse |
+| `MCP_IMAP_EXTRACT_MEMORY_MB` | `512` | Heap limit of the extraction worker (protects against decompression bombs) |
+| `MCP_IMAP_OCR` | `auto` | OCR for scanned PDFs and images when the optional packages are installed; `off` disables it |
+| `MCP_IMAP_OCR_LANGS` | `deu+eng` | Tesseract languages. German and English are bundled; other languages are downloaded from the tesseract.js CDN unless `MCP_IMAP_OCR_LANG_PATH` is set |
+| `MCP_IMAP_OCR_LANG_PATH` | – | Directory or URL with `<lang>.traineddata.gz` files |
+| `MCP_IMAP_OCR_MAX_PAGES` | `10` | Scanned pages OCR'd per call (request more with `pages`) |
+| `MCP_IMAP_OCR_TIMEOUT` | `180` | Seconds one OCR run may take |
+| `MCP_IMAP_RENDER_MAX_PAGES` | `5` | PDF pages rendered per call with `format: "images"` |
 
 ### Multiple accounts via config file
 
@@ -246,7 +260,9 @@ then run `/mcp` in Claude Code to authenticate.
 | `MCP_IMAP_TRUST_PROXY` | `false` | Trust `X-Forwarded-*` from one reverse proxy |
 | `MCP_IMAP_ACCESS_TOKEN_TTL` | `3600` | Access token lifetime in seconds |
 | `MCP_IMAP_REFRESH_TOKEN_TTL` | `2592000` | Refresh token lifetime in seconds (30 days) |
-| `MCP_IMAP_MODE`, `MCP_IMAP_ALLOW_SEND`, `MCP_IMAP_ALLOW_DELETE`, `MCP_IMAP_LOG_FOLDER`, `MCP_IMAP_MAX_*` | | Same as for stdio; they limit what can be granted |
+| `MCP_IMAP_DOWNLOAD_LINKS` | `true` | Signed download links for attachments (`/attachments/<token>`), see [Attachments](#attachments) |
+| `MCP_IMAP_DOWNLOAD_TTL` | `600` | Validity of a download link in seconds |
+| `MCP_IMAP_MODE`, `MCP_IMAP_ALLOW_SEND`, `MCP_IMAP_ALLOW_DELETE`, `MCP_IMAP_LOG_FOLDER`, `MCP_IMAP_MAX_*`, `MCP_IMAP_EXTRACT_*`, `MCP_IMAP_OCR*` | | Same as for stdio |
 
 ### User management
 
@@ -279,8 +295,9 @@ The commands use `MCP_IMAP_DB`; they do not need the secret key.
 | `mailbox_status` | Message/unseen counts, UIDNEXT, UIDVALIDITY |
 | `list_messages` | Newest messages first with pagination (`limit`, `offset`) |
 | `search_messages` | IMAP SEARCH by text, from, to, cc, subject, body, date range, flags, size, keyword, header |
-| `get_message` | Headers, decoded body (text / html / both), attachment list |
-| `get_attachment` | Content of an attachment by part id |
+| `get_message` | Headers, decoded body (text / html / both), attachment list with `textAvailable`, `resourceUri` and (HTTP) `downloadUrl` |
+| `get_attachment` | An attachment by part id: PDF, Word, Excel, attached e-mails, HTML and text as **plain text**; images, rendered PDF pages, the original file or just links on request (see [Attachments](#attachments)) |
+| `save_attachment` | Save attachments of a message as files into `MCP_IMAP_DOWNLOAD_DIR` (stdio, only if configured) |
 
 ### Read-write mode only
 
@@ -301,7 +318,29 @@ The commands use `MCP_IMAP_DB`; they do not need the secret key.
 
 All tools take an optional `account` argument; without it, the first configured account is used. Messages are addressed by their IMAP **UID** within a mailbox.
 
+`get_message` and `get_attachment` also return `structuredContent` with a JSON output schema, so programs can read fields such as `downloadUrl`, `textInfo.nextOffset` or `kind` without parsing text.
+
 On the HTTP server, the write tools are only listed if the server runs in read-write mode **and** the access token has the `mail:organize` scope; the delete tools additionally need `mail:delete`, `send_email` needs `mail:send`.
+
+## Attachments
+
+Every MCP client can show text, but support for images, embedded files and links differs between chat platforms, IDEs and automation tools. The server therefore does the work itself and offers several ways to get an attachment:
+
+| `format` | Result | For |
+| --- | --- | --- |
+| `auto` (default) | Text for PDF, Word (`.docx`), Excel (`.xlsx`), attached e-mails (`.eml`), HTML, CSV and other text files. Images as image **plus** OCR text. Unknown types as base64 resource | Every chat client |
+| `text` | Text only; fails if the type cannot be converted | Pipelines that only handle text |
+| `raw` | Original file as base64 embedded resource (images as image) | Clients that handle embedded files |
+| `images` | PDF pages rendered as PNG images (`pages`, max. `MCP_IMAP_RENDER_MAX_PAGES`) | Vision models, layouts, poor scans |
+| `link` | Only metadata, `resource_link` and download link, without downloading the file | Large files, programs |
+
+- **Detection by content:** PDFs and Office files are recognized by their content, also when the mail program sent them as `application/octet-stream`.
+- **Long documents** come in chunks: `max_chars` (default `MCP_IMAP_MAX_BODY_CHARS`) and `offset`; the response contains `textInfo.nextOffset`. For PDFs, `pages: "2-4"` selects pages, and every page starts with `--- Page n of m ---`. Parsed documents are cached for 15 minutes, so paging does not parse the file again.
+- **Scanned PDFs and images** have no text layer. Pages with almost no text are OCR'd with [tesseract.js](https://github.com/naptha/tesseract.js) (German and English bundled, at most `MCP_IMAP_OCR_MAX_PAGES` per call); `textInfo.ocrPages` lists them. OCR (`tesseract.js` with `@tesseract.js-data/deu` and `eng`), PDF rendering (`@napi-rs/canvas`) and pdf.js' standard fonts and CMaps (`pdfjs-dist`) are optional dependencies: if they are missing (e.g. `npm install --omit=optional`), text-layer PDFs still work and the response explains what is missing. The Docker image contains all of them.
+- **Isolation:** files are parsed in a worker thread with a heap limit and a timeout, so a broken or malicious file cannot block or crash the server.
+- **MCP resources:** every attachment has a URI `imap://{account}/{mailbox}/{uid}/{part}` that clients with resource support can read via `resources/read` (original file).
+- **Download links (HTTP server):** `get_message` and `get_attachment` return a `downloadUrl` like `https://mail.example.com/attachments/<token>/Rechnung.pdf`. The signed token is the only credential, so code sandboxes, n8n, Zapier or `curl` can fetch the original file without the OAuth token. A link is valid for `MCP_IMAP_DOWNLOAD_TTL` seconds (10 minutes), works only for this one attachment of this user, stops working when the mailbox's UIDVALIDITY changes, and is served with `Content-Security-Policy: sandbox` and `nosniff`. Each download is written to the server log and, for writable mailboxes, to the `MCP Log` folder. Treat links like passwords while they are valid; disable them with `MCP_IMAP_DOWNLOAD_LINKS=false`.
+- **Local files (stdio):** with `MCP_IMAP_DOWNLOAD_DIR=/path` the tool `save_attachment` saves all or selected attachments of a message into that directory (sanitized file names, existing files are never overwritten unless `overwrite: true`) and returns path, size and SHA-256 of each file.
 
 ## Security notes
 
@@ -310,6 +349,7 @@ On the HTTP server, the write tools are only listed if the server runs in read-w
 - Tool results contain email content, which is untrusted input. A malicious email could try to instruct the model ("prompt injection"). Review actions such as sending or deleting before approving them in your client.
 - Use `--no-send` if you want write access to mailboxes but never want the model to send email, and `--no-delete` if nothing may ever be deleted.
 - Check the `MCP Log` folder to see what the model changed.
+- Attachment text is untrusted input as well. Documents are parsed in an isolated worker with time and memory limits; download links are short-lived capability URLs.
 - HTTP server: keep `MCP_IMAP_SECRET_KEY` secret and backed up, keep registration disabled unless you need it, and run it only behind HTTPS. The web UI uses `__Host-` cookies, CSRF tokens, a strict Content-Security-Policy and rate-limited login. Users can revoke connected applications at any time.
 
 ## Development

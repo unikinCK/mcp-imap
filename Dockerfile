@@ -2,7 +2,11 @@ FROM node:24-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json tsconfig.json ./
 COPY src ./src
-RUN npm ci --ignore-scripts && npm run build && npm prune --omit=dev
+# Of pdf.js only the font and CMap data are used at runtime, of the OCR language data only the LSTM models.
+RUN npm ci --ignore-scripts && npm run build && npm prune --omit=dev \
+ && rm -rf node_modules/pdfjs-dist/build node_modules/pdfjs-dist/legacy node_modules/pdfjs-dist/web \
+           node_modules/pdfjs-dist/types node_modules/pdfjs-dist/image_decoders \
+           node_modules/@tesseract.js-data/*/4.0.0
 
 FROM node:24-alpine
 ENV NODE_ENV=production \
