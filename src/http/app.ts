@@ -105,6 +105,7 @@ export function createHttpApp(config: HttpConfig, store = new Store(config.dbPat
         accounts: store.accountConfigs(userId),
         maxBodyChars: config.maxBodyChars,
         maxAttachmentBytes: config.maxAttachmentBytes,
+        maxBase64Bytes: config.maxBase64Bytes,
         extract: config.extract,
       };
       ({ server } = createServer(serverConfig, {

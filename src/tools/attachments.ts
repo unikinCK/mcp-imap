@@ -39,12 +39,14 @@ const attachmentOutput = {
   filename: z.string().optional(),
   contentType: z.string(),
   size: z.number().optional().describe('Decoded size in bytes.'),
+  sha256: z.string().optional().describe('SHA-256 of the file (hex), e.g. for client_sha256 of the receiving tool.'),
   kind: z.enum(KINDS),
-  format: z.enum(['text', 'raw', 'images', 'link']).describe('What this response contains.'),
+  format: z.enum(['text', 'raw', 'images', 'link', 'base64']).describe('What this response contains.'),
   resourceUri: z.string().describe('MCP resource URI (resources/read) of the original file.'),
   downloadUrl: z.string().optional().describe('Short-lived HTTPS link to the original file, usable without a token.'),
   downloadExpiresAt: z.string().optional(),
   text: z.string().optional(),
+  base64: z.string().optional().describe('The file as base64 (format "base64").'),
   textInfo: textInfoSchema.optional(),
   images: z.number().optional().describe('Number of image content blocks (e.g. rendered PDF pages).'),
   warnings: z.array(z.string()).optional(),
@@ -52,15 +54,17 @@ const attachmentOutput = {
 
 type AttachmentOutput = {
   [K in keyof typeof attachmentOutput]?: z.infer<(typeof attachmentOutput)[K]>;
-} & { uid: number; mailbox: string; part: string; contentType: string; kind: DocKind; format: 'text' | 'raw' | 'images' | 'link'; resourceUri: string };
+} & { uid: number; mailbox: string; part: string; contentType: string; kind: DocKind; format: 'text' | 'raw' | 'images' | 'link' | 'base64'; resourceUri: string };
 
 function result(info: AttachmentOutput, extra: ContentBlock[] = []): CallToolResult {
-  const { text, ...rest } = info;
+  const { text, base64, ...rest } = info;
   const content: ContentBlock[] = [{ type: 'text', text: JSON.stringify(rest, null, 2) }];
   if (text !== undefined) {
     const more = info.textInfo?.nextOffset !== undefined ? `\n\n[... truncated - continue with offset ${info.textInfo.nextOffset}]` : '';
     content.push({ type: 'text', text: text + more });
   }
+  // Plain text, not an embedded resource: many clients do not show embedded files to the model.
+  if (base64 !== undefined) content.push({ type: 'text', text: base64 });
   content.push(...extra);
   return { content, structuredContent: info as unknown as Record<string, unknown> };
 }
@@ -90,6 +94,18 @@ function window(text: string, offset: number, maxChars: number): { text: string;
     text: slice,
     info: { offset, returnedChars: slice.length, totalChars: text.length, truncated, ...(truncated ? { nextOffset: end } : {}) },
   };
+}
+
+async function hashPart(client: ImapFlow, uid: number, part: string): Promise<{ size: number; sha256: string }> {
+  const download = await client.download(String(uid), part, { uid: true });
+  if (!('content' in download) || !download.content) throw new ToolError(`Part ${part} of message ${uid} was not found.`);
+  const hash = createHash('sha256');
+  let size = 0;
+  for await (const chunk of download.content as AsyncIterable<Buffer>) {
+    hash.update(chunk);
+    size += chunk.length;
+  }
+  return { size, sha256: hash.digest('hex') };
 }
 
 async function fetchStructure(client: ImapFlow, uid: number, mailbox: string): Promise<MessageStructureObject | undefined> {
@@ -134,7 +150,10 @@ export function registerAttachmentTools(
         'format "auto" (default) returns PDF, Word (.docx), Excel (.xlsx), attached e-mails, HTML and text files as plain text, ' +
         'images as image plus OCR text, and anything else as base64 resource. ' +
         '"text" forces text, "raw" returns the original file (base64), "images" renders PDF pages as PNG images, ' +
-        '"link" returns only metadata and links without downloading. Long documents are returned in chunks: use offset ' +
+        '"link" returns only metadata, sha256 and links, "base64" the file as base64 text (small files only). ' +
+        'To hand the file to another tool (e.g. a document upload): first pass downloadUrl (if present) and sha256 to ' +
+        'its URL parameter (such as source_url); only if the tool has no URL parameter, rejects the link or there is no ' +
+        'downloadUrl, use format "base64" and pass that text plus sha256. Long documents are returned in chunks: use offset ' +
         'and max_chars, and pages (e.g. "1-3") for PDFs.' +
         ocrNote +
         (linker ? ' Every response includes a short-lived downloadUrl for programs that need the original file.' : ''),
@@ -143,7 +162,7 @@ export function registerAttachmentTools(
         mailbox: mailboxArg,
         uid: z.number().int().positive(),
         part: partArg,
-        format: z.enum(['auto', 'text', 'raw', 'images', 'link']).default('auto'),
+        format: z.enum(['auto', 'text', 'raw', 'images', 'link', 'base64']).default('auto'),
         pages: z.string().optional().describe('PDF page selection, e.g. "1-3,5" or "4-". Default: all pages (text) or the first pages (images).'),
         offset: z.number().int().min(0).default(0).describe('Start position in the extracted text, for reading long documents in chunks.'),
         max_chars: z
@@ -164,10 +183,12 @@ export function registerAttachmentTools(
         if (args.format === 'link') {
           const node = findPart(await fetchStructure(client, uid, mailbox), part);
           if (!node) throw new ToolError(`Part ${part} of message ${uid} was not found.`);
+          // Hash while streaming, so the receiver of the link can verify the file without loading it here.
+          const { size, sha256 } = await hashPart(client, uid, part);
           const filename = filenameOf(node);
           const { kind, mimeType } = detectKind(node.type, filename);
           const { base } = describe(acc, client, mailbox, uid, part, filename);
-          const info: AttachmentOutput = { ...base, contentType: mimeType, size: node.size, kind, format: 'link' };
+          const info: AttachmentOutput = { ...base, contentType: mimeType, size, sha256, kind, format: 'link' };
           return result(info, [linkContent(info)]);
         }
 
@@ -182,9 +203,23 @@ export function registerAttachmentTools(
           );
         }
         const { kind, mimeType } = detectKind(meta.contentType, filename, data);
-        const info: AttachmentOutput = { ...base, contentType: mimeType, size: data.length, kind, format: 'text' };
+        const sha256 = createHash('sha256').update(data).digest('hex');
+        const info: AttachmentOutput = { ...base, contentType: mimeType, size: data.length, sha256, kind, format: 'text' };
         const warnings: string[] = [];
         const done = (extra: ContentBlock[] = []) => result({ ...info, ...(warnings.length ? { warnings } : {}) }, extra);
+
+        if (args.format === 'base64') {
+          if (data.length > config.maxBase64Bytes) {
+            throw new ToolError(
+              `The file has ${data.length} bytes, more than the ${config.maxBase64Bytes} bytes allowed for format "base64" ` +
+                '(MCP_IMAP_MAX_BASE64_BYTES).' +
+                ('downloadUrl' in base ? ' Pass the downloadUrl to the receiving tool instead.' : ' Use save_attachment instead.'),
+            );
+          }
+          info.format = 'base64';
+          info.base64 = data.toString('base64');
+          return done();
+        }
 
         if (args.format === 'raw') {
           info.format = 'raw';

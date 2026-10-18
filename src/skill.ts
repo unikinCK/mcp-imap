@@ -90,6 +90,17 @@ export function buildSkill({ config, accounts, downloadLinks }: SkillContext): s
         `(valid for a few minutes, no token needed). Treat it like a password.`,
     );
   }
+  add(
+    '- **Hand an attachment to another tool** (e.g. a bookkeeping `upload_document`): never copy file contents by hand.',
+    downloadLinks
+      ? '  1. `get_attachment` with `format: "link"` returns `downloadUrl` and `sha256`. Pass them to the URL parameter of the ' +
+          'receiving tool (e.g. `source_url` and `client_sha256`). This is the first choice: the file goes server to server.\n' +
+          '  2. Only if the tool has no URL parameter, or rejects the link (not reachable, host not allowed, expired), call ' +
+          `\`get_attachment\` with \`format: "base64"\` (files up to ${config.maxBase64Bytes} bytes) and pass that text and ` +
+          '`sha256` (e.g. as `content_base64`). An expired link: just request a new one first.'
+      : `  There are no download links on this server: use \`get_attachment\` with \`format: "base64"\` (files up to ${config.maxBase64Bytes} bytes) ` +
+          'and pass that text plus `sha256` (e.g. as `content_base64` and `client_sha256`).',
+  );
   if (config.downloadDir) add(`- **Save files locally:** \`save_attachment\` writes attachments into ${config.downloadDir}.`);
   if (anyWritable) {
     add(

@@ -99,6 +99,7 @@ export function downloadRouter(options: {
         accounts,
         maxBodyChars: config.maxBodyChars,
         maxAttachmentBytes: config.maxAttachmentBytes,
+        maxBase64Bytes: config.maxBase64Bytes,
         extract: config.extract,
       },
       poolFor(payload.u),

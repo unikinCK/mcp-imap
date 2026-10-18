@@ -96,6 +96,8 @@ export interface ServerConfig {
   accounts: AccountConfig[];
   maxBodyChars: number;
   maxAttachmentBytes: number;
+  /** Largest attachment get_attachment returns as base64 text (format "base64"). */
+  maxBase64Bytes: number;
   extract: ExtractConfig;
   /** Local directory for save_attachment (stdio only); undefined hides the tool. */
   downloadDir?: string;
@@ -135,7 +137,7 @@ Environment (single account, used when no --config is given):
   MCP_IMAP_NOTES_FOLDER ("MCP Notes"; "off" disables mailbox notes),
   MCP_IMAP_SKILL_FILE (Markdown with instance-specific instructions for get_skill),
   MCP_IMAP_MAX_BODY_CHARS (50000), MCP_IMAP_MAX_ATTACHMENT_BYTES (10485760),
-  MCP_IMAP_DOWNLOAD_DIR (enables save_attachment; stdio only)
+  MCP_IMAP_MAX_BASE64_BYTES (1048576), MCP_IMAP_DOWNLOAD_DIR (enables save_attachment; stdio only)
 
 Environment (attachment text extraction):
   MCP_IMAP_EXTRACT_TIMEOUT (30 seconds), MCP_IMAP_EXTRACT_MEMORY_MB (512),
@@ -357,6 +359,7 @@ export interface BaseConfig {
   skillFile?: string;
   maxBodyChars: number;
   maxAttachmentBytes: number;
+  maxBase64Bytes: number;
   extract: ExtractConfig;
 }
 
@@ -379,6 +382,7 @@ export function loadBaseConfig(args: CliArgs, env: NodeJS.ProcessEnv = process.e
     skillFile: env.MCP_IMAP_SKILL_FILE?.trim() || undefined,
     maxBodyChars: parseInt10(env.MCP_IMAP_MAX_BODY_CHARS, 50_000, 'MCP_IMAP_MAX_BODY_CHARS'),
     maxAttachmentBytes: parseInt10(env.MCP_IMAP_MAX_ATTACHMENT_BYTES, 10 * 1024 * 1024, 'MCP_IMAP_MAX_ATTACHMENT_BYTES'),
+    maxBase64Bytes: parseInt10(env.MCP_IMAP_MAX_BASE64_BYTES, 1024 * 1024, 'MCP_IMAP_MAX_BASE64_BYTES'),
     extract: loadExtractConfig(env),
   };
 }

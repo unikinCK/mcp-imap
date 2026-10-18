@@ -20,6 +20,7 @@ export interface HttpConfig {
   refreshTokenTtl: number;
   maxBodyChars: number;
   maxAttachmentBytes: number;
+  maxBase64Bytes: number;
   extract: ExtractConfig;
   /** Signed, short-lived download links for attachments (GET /attachments/<token>). */
   downloadLinks: boolean;
