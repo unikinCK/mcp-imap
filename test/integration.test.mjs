@@ -505,6 +505,32 @@ describe('integration', { skip: !host && 'IMAP_TEST_HOST not set' }, () => {
       assert.equal(images.content.filter((c) => c.type === 'image' && c.mimeType === 'image/png').length, 2);
     });
 
+    test('hands files over as link with sha256, or as base64 text', async () => {
+      const part = byName('AR-0000-635976.pdf').part;
+      const sha = createHash('sha256').update(invoice).digest('hex');
+      const link = (await call(client, 'get_attachment', { uid, part, format: 'link' })).structuredContent;
+      assert.equal(link.sha256, sha);
+      assert.equal(link.size, invoice.length, 'decoded size, not the size of the base64 transfer encoding');
+
+      const b64 = await call(client, 'get_attachment', { uid, part, format: 'base64' });
+      assert.equal(b64.structuredContent.format, 'base64');
+      assert.equal(b64.structuredContent.sha256, sha);
+      assert.equal(b64.content[1].type, 'text', 'base64 is plain text, so every client passes it to the model');
+      assert.ok(Buffer.from(b64.content[1].text, 'base64').equals(invoice));
+      assert.equal(JSON.parse(b64.content[0].text).base64, undefined);
+
+      const small = await startClient(['--read-only'], { mailUser: docsUser, env: { MCP_IMAP_MAX_BASE64_BYTES: '1000' } });
+      try {
+        const tooBig = await small.callTool({ name: 'get_attachment', arguments: { uid, part, format: 'base64' } });
+        assert.ok(tooBig.isError);
+        assert.match(tooBig.content[0].text, /MCP_IMAP_MAX_BASE64_BYTES/);
+        const skill = (await call(small, 'get_skill', {})).structuredContent.skill;
+        assert.match(skill, /There are no download links on this server: use `get_attachment` with `format: "base64"` \(files up to 1000 bytes\)/);
+      } finally {
+        await small.close();
+      }
+    });
+
     test('serves attachments as MCP resources', async () => {
       const { resourceTemplates } = await client.listResourceTemplates();
       assert.ok(resourceTemplates.some((t) => t.uriTemplate === 'imap://{account}/{mailbox}/{uid}/{part}'));

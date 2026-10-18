@@ -375,6 +375,13 @@ describe('http server', () => {
     assert.match(text.text, /unikin GmbH/);
     assert.ok(text.downloadUrl);
 
+    const link = await call('get_attachment', { uid: msg.uid, part: att.part, format: 'link' });
+    assert.equal(link.sha256, createHash('sha256').update(pdf).digest('hex'));
+    assert.ok(link.downloadUrl.startsWith(`${base}/attachments/`));
+    const skill = await call('get_skill', {});
+    assert.match(skill.skill, /`format: "link"` returns `downloadUrl` and `sha256`/);
+    assert.match(skill.skill, /Only if the tool has no URL parameter/);
+
     // The link works without the OAuth token (e.g. from a code sandbox) and returns the original bytes.
     const res = await fetch(att.downloadUrl);
     assert.equal(res.status, 200);

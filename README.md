@@ -89,6 +89,7 @@ General settings:
 | `MCP_IMAP_SKILL_FILE` | – | Markdown file with instructions for this instance, appended to `get_skill` |
 | `MCP_IMAP_MAX_BODY_CHARS` | `50000` | Default maximum length of a returned message body |
 | `MCP_IMAP_MAX_ATTACHMENT_BYTES` | `10485760` | Maximum attachment size returned by `get_attachment` |
+| `MCP_IMAP_MAX_BASE64_BYTES` | `1048576` | Largest file `get_attachment` returns with `format: "base64"` |
 | `MCP_IMAP_DOWNLOAD_DIR` | – | Enables `save_attachment`, which writes attachments into this local directory (stdio only) |
 
 Settings for reading attachments as text (stdio and HTTP):
@@ -337,7 +338,8 @@ Every MCP client can show text, but support for images, embedded files and links
 | `text` | Text only; fails if the type cannot be converted | Pipelines that only handle text |
 | `raw` | Original file as base64 embedded resource (images as image) | Clients that handle embedded files |
 | `images` | PDF pages rendered as PNG images (`pages`, max. `MCP_IMAP_RENDER_MAX_PAGES`) | Vision models, layouts, poor scans |
-| `link` | Only metadata, `resource_link` and download link, without downloading the file | Large files, programs |
+| `link` | Only metadata, `sha256`, `resource_link` and download link | Large files, programs, handing files to other tools |
+| `base64` | The original file as base64 **plain text** (up to `MCP_IMAP_MAX_BASE64_BYTES`, default 1 MiB) | Fallback for tools that only take `content_base64` |
 
 - **Detection by content:** PDFs and Office files are recognized by their content, also when the mail program sent them as `application/octet-stream`.
 - **Long documents** come in chunks: `max_chars` (default `MCP_IMAP_MAX_BODY_CHARS`) and `offset`; the response contains `textInfo.nextOffset`. For PDFs, `pages: "2-4"` selects pages, and every page starts with `--- Page n of m ---`. Parsed documents are cached for 15 minutes, so paging does not parse the file again.
@@ -345,6 +347,7 @@ Every MCP client can show text, but support for images, embedded files and links
 - **Isolation:** files are parsed in a worker thread with a heap limit and a timeout, so a broken or malicious file cannot block or crash the server.
 - **MCP resources:** every attachment has a URI `imap://{account}/{mailbox}/{uid}/{part}` that clients with resource support can read via `resources/read` (original file).
 - **Download links (HTTP server):** `get_message` and `get_attachment` return a `downloadUrl` like `https://mail.example.com/attachments/<token>/Rechnung.pdf`. The signed token is the only credential, so code sandboxes, n8n, Zapier or `curl` can fetch the original file without the OAuth token. A link is valid for `MCP_IMAP_DOWNLOAD_TTL` seconds (10 minutes), works only for this one attachment of this user, stops working when the mailbox's UIDVALIDITY changes, and is served with `Content-Security-Policy: sandbox` and `nosniff`. Each download is written to the server log and, for writable mailboxes, to the `MCP Log` folder. Treat links like passwords while they are valid; disable them with `MCP_IMAP_DOWNLOAD_LINKS=false`.
+- **Handing a file to another tool** (e.g. OpenBuchhaltung `upload_document`): first try the link. `format: "link"` returns `downloadUrl` and `sha256`, which go to the receiving tool's `source_url` and `client_sha256`, so the file travels server to server. Only if the tool has no URL parameter, rejects the link, or there is no link (stdio), use `format: "base64"` and pass the text as `content_base64`. That way the whole file passes through the model (a 200 KB PDF is well over 100,000 tokens), so it only suits small files. `get_skill` and the tool description tell the model this order.
 - **Local files (stdio):** with `MCP_IMAP_DOWNLOAD_DIR=/path` the tool `save_attachment` saves all or selected attachments of a message into that directory (sanitized file names, existing files are never overwritten unless `overwrite: true`) and returns path, size and SHA-256 of each file.
 
 ## Mailbox notes and instance guide
