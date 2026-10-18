@@ -6,7 +6,7 @@
 //   IMAP_TEST_HOST=localhost npm test
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
@@ -36,6 +36,8 @@ const WRITE_TOOLS = [
   'forward_messages',
   'reply_message',
   'send_email',
+  'save_note',
+  'delete_note',
 ];
 
 async function startClient(args, { mailUser = user, env = {} } = {}) {
@@ -524,6 +526,108 @@ describe('integration', { skip: !host && 'IMAP_TEST_HOST not set' }, () => {
       const renamed = await call(client, 'save_attachment', { uid, parts: [byName('Angebot.docx').part], filename: '../../evil.docx' });
       assert.equal(renamed.structuredContent.files[0].path, join(downloadDir, 'evil.docx'));
       assert.equal(readdirSync(downloadDir).filter((f) => f.endsWith('.partial')).length, 0);
+    });
+  });
+
+  describe('mailbox notes and skill', () => {
+    const notesUser = `notes-${Date.now()}@example.com`;
+    const skillFile = join(mkdtempSync(join(tmpdir(), 'mcp-imap-skill-')), 'skill.md');
+    writeFileSync(skillFile, 'Rechnungen an unikin GmbH gehen in den Ordner "Buchhaltung".');
+    let rw;
+    let ro;
+
+    before(async () => {
+      const transport = nodemailer.createTransport({ host, port: Number(smtpPort), secure: false, ignoreTLS: true });
+      await transport.sendMail({ from: 'news@example.com', to: notesUser, subject: 'Newsletter', text: 'Angebote' });
+      transport.close();
+      await new Promise((r) => setTimeout(r, 300));
+      rw = await startClient(['--read-write'], { mailUser: notesUser, env: { MCP_IMAP_SKILL_FILE: skillFile } });
+      ro = await startClient(['--read-only'], { mailUser: notesUser });
+    });
+    after(async () => {
+      await rw?.close();
+      await ro?.close();
+    });
+
+    test('saves, lists, replaces and deletes notes per mailbox', async () => {
+      assert.deepEqual((await call(rw, 'get_notes', {})).structuredContent.notes, []);
+      const general = (await call(rw, 'save_note', { title: 'Newsletter', text: 'Newsletter und Werbung nach "95 Newsletter & Werbung" verschieben.' })).structuredContent;
+      assert.ok(general.note.id > 0);
+      assert.match(general.logFolder, /MCP Log/);
+      await call(rw, 'save_note', { title: 'Rechnungen', text: 'Rechnungsadresse muss unikin GmbH sein – prüfen.', folder: 'INBOX' });
+      await call(rw, 'save_note', { title: 'Archiv', text: 'Nichts löschen.', folder: '95 Newsletter & Werbung/Büro' });
+
+      const all = (await call(rw, 'get_notes', {})).structuredContent.notes;
+      assert.equal(all.length, 3);
+      const invoice = all.find((n) => n.title === 'Rechnungen');
+      assert.equal(invoice.folder, 'INBOX');
+      assert.equal(invoice.text, 'Rechnungsadresse muss unikin GmbH sein – prüfen.');
+      assert.equal(invoice.author, 'local stdio client');
+      const inbox = (await call(rw, 'get_notes', { folder: 'inbox' })).structuredContent.notes.map((n) => n.title).sort();
+      assert.deepEqual(inbox, ['Newsletter', 'Rechnungen'], 'folder filter keeps general notes and those of the folder');
+
+      const updated = (await call(rw, 'save_note', { title: 'Newsletter', text: 'Newsletter nach "Werbung".', replace_id: general.note.id })).structuredContent;
+      assert.equal(updated.replaced.id, general.note.id);
+      const after = (await call(rw, 'get_notes', {})).structuredContent.notes;
+      assert.equal(after.length, 3);
+      assert.equal(after.find((n) => n.title === 'Newsletter').text, 'Newsletter nach "Werbung".');
+
+      const deleted = (await call(rw, 'delete_note', { id: after.find((n) => n.title === 'Archiv').id })).structuredContent;
+      assert.equal(deleted.deleted.title, 'Archiv');
+      assert.equal(deleted.deleted.folder, '95 Newsletter & Werbung/Büro');
+      assert.equal((await call(rw, 'get_notes', {})).structuredContent.notes.length, 2);
+      const missing = await rw.callTool({ name: 'delete_note', arguments: { id: deleted.deleted.id } });
+      assert.ok(missing.isError);
+
+      const log = await callJson(rw, 'list_messages', { mailbox: 'MCP Log', limit: 20 });
+      const subjects = log.messages.map((m) => m.subject);
+      assert.ok(subjects.includes('[mcp-imap] Saved note "Rechnungen" for INBOX'));
+      assert.ok(subjects.includes('[mcp-imap] Updated note "Newsletter"'));
+      assert.ok(subjects.includes('[mcp-imap] Deleted note "Archiv" for 95 Newsletter & Werbung/Büro'));
+    });
+
+    test('protects the notes folder from the generic tools', async () => {
+      const { messages } = await callJson(rw, 'list_messages', {});
+      for (const [name, args] of [
+        ['copy_messages', { uids: [messages[0].uid], destination: 'MCP Notes' }],
+        ['rename_mailbox', { path: 'MCP Notes', new_path: 'Other' }],
+        ['update_flags', { mailbox: 'MCP Notes', uids: [1], remove: ['seen'] }],
+      ]) {
+        const result = await rw.callTool({ name, arguments: args });
+        assert.ok(result.isError, `${name} must be rejected`);
+        assert.match(result.content[0].text, /holds the mailbox notes/);
+      }
+    });
+
+    test('read-only clients can read but not change notes', async () => {
+      const names = (await ro.listTools()).tools.map((t) => t.name);
+      assert.ok(names.includes('get_notes') && names.includes('get_skill'));
+      assert.ok(!names.includes('save_note') && !names.includes('delete_note'));
+      assert.equal((await call(ro, 'get_notes', {})).structuredContent.notes.length, 2);
+    });
+
+    test('get_skill describes this instance, also as resource and prompt', async () => {
+      const skill = (await call(rw, 'get_skill', {})).structuredContent.skill;
+      assert.match(skill, /Server mode: \*\*read-write\*\*/);
+      assert.match(skill, new RegExp(`\\| default \\| ${notesUser.replace('.', '\\.')} \\| full \\| yes \\| yes \\| yes \\|`));
+      assert.match(skill, /`save_note`/);
+      assert.match(skill, /## Instructions for this instance\n\nRechnungen an unikin GmbH gehen in den Ordner "Buchhaltung"\./);
+
+      writeFileSync(skillFile, 'Neue Anweisung.');
+      assert.match((await call(rw, 'get_skill', {})).structuredContent.skill, /Neue Anweisung\./, 'the file is read on every call');
+
+      const roSkill = (await call(ro, 'get_skill', {})).structuredContent.skill;
+      assert.match(roSkill, /Server mode: \*\*read-only\*\*/);
+      assert.doesNotMatch(roSkill, /save_note|send_email|Instructions for this instance/);
+
+      const { contents } = await rw.readResource({ uri: 'mcp-imap://skill' });
+      assert.equal(contents[0].mimeType, 'text/markdown');
+      const prompt = await rw.getPrompt({ name: 'mail_assistant' });
+      assert.match(prompt.messages[0].content.text, /# Mail assistant/);
+
+      const { instructions } = rw.getInstructions ? { instructions: rw.getInstructions() } : { instructions: '' };
+      assert.match(instructions, /get_notes/);
+      assert.match(instructions, /get_skill/);
     });
   });
 });

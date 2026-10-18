@@ -99,6 +99,8 @@ export function createHttpApp(config: HttpConfig, store = new Store(config.dbPat
         allowSend: canWrite && config.allowSend && granted.send,
         allowDelete: canWrite && config.allowDelete && granted.delete,
         logFolder: config.logFolder,
+        notesFolder: config.notesFolder,
+        skillFile: config.skillFile,
         actor: `${client?.client_name || auth.clientId} (mcp-imap user ${user?.username ?? userId}, scopes: ${auth.scopes.join(' ')})`,
         accounts: store.accountConfigs(userId),
         maxBodyChars: config.maxBodyChars,

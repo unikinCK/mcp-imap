@@ -314,7 +314,7 @@ async function verifiedMove(client: ImapFlow, from: string, uids: number[], to: 
 }
 
 export function registerWriteTools(server: McpServer, accounts: AccountManager, config: ServerConfig): void {
-  const audit = new AuditLog(config.logFolder, config.actor ?? 'unknown client');
+  const audit = new AuditLog(config.logFolder, config.actor ?? 'unknown client', config.notesFolder);
   const logNote = audit.enabled ? ` Every change is recorded in the "${audit.folder}" folder.` : '';
 
   server.registerTool(
@@ -338,7 +338,7 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
       const removeFlags = (remove ?? []).map(toImapFlag);
       if (!addFlags.length && !removeFlags.length) throw new ToolError('Nothing to do: provide add and/or remove.');
       return accounts.withMailbox(account, mailbox, true, async (client, acc) => {
-        audit.assertNotLogFolder(client, mailbox);
+        audit.assertNotProtected(client, mailbox);
         const range = uids.join(',');
         const messages = await describeMessages(client, uids);
         if (addFlags.length) await client.messageFlagsAdd(range, addFlags, { uid: true });
@@ -372,7 +372,7 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
       accounts.assertWritable(account);
       if (destination === mailbox) throw new ToolError('Source and destination are the same mailbox.');
       return accounts.withClient(account, async (client, acc) => {
-        audit.assertNotLogFolder(client, mailbox, destination);
+        audit.assertNotProtected(client, mailbox, destination);
         if (!accounts.canDelete(account)) {
           const trash = await findSpecialUse(client, '\\Trash');
           if (trash && trash.path.toLowerCase() === destination.toLowerCase()) {
@@ -426,7 +426,7 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
     },
     handler(async ({ account, mailbox, uids, destination }) =>
       accounts.withMailbox(account, mailbox, true, async (client, acc) => {
-        audit.assertNotLogFolder(client, mailbox, destination);
+        audit.assertNotProtected(client, mailbox, destination);
         const messages = await describeMessages(client, uids);
         const result = await client.messageCopy(uids.join(','), destination, { uid: true });
         if (!result) throw new ToolError('Copy failed.');
@@ -473,7 +473,7 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
       accounts.assertWritable(account);
       if (path.toUpperCase() === 'INBOX') throw new ToolError('INBOX cannot be renamed.');
       return accounts.withClient(account, async (client, acc) => {
-        audit.assertNotLogFolder(client, path, new_path);
+        audit.assertNotProtected(client, path, new_path);
         const result = await client.mailboxRename(path, new_path);
         const log = await audit.write(client, acc, {
           action: 'rename_mailbox',
@@ -500,7 +500,7 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
     handler(async (args) => {
       accounts.assertWritable(args.account);
       return accounts.withClient(args.account, async (client, account) => {
-        audit.assertNotLogFolder(client, args.drafts_mailbox);
+        audit.assertNotProtected(client, args.drafts_mailbox);
         const reply = args.reply_to_message ? await loadReplyContext(client, args.reply_to_message) : undefined;
         const attachments = await loadAttachmentRefs(client, args.attach_from_messages ?? [], new ByteBudget());
         const { raw, messageId, envelope, subject, attachmentNames } = await buildMessage(account, args, reply, { attachments });
@@ -546,7 +546,7 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
     handler(async (args) => {
       accounts.assertWritable(args.account);
       return accounts.withClient(args.account, async (client, account) => {
-        audit.assertNotLogFolder(client, args.drafts_mailbox);
+        audit.assertNotProtected(client, args.drafts_mailbox);
         const budget = new ByteBudget();
         const asAttachment = args.mode === 'attachment';
         const sources = [];
@@ -653,7 +653,7 @@ export function registerWriteTools(server: McpServer, accounts: AccountManager, 
       else accounts.assertWritable(args.account);
       if (!args.text && !args.html) throw new ToolError('Either text or html is required.');
       return accounts.withClient(args.account, async (client, account) => {
-        audit.assertNotLogFolder(client, args.drafts_mailbox);
+        audit.assertNotProtected(client, args.drafts_mailbox);
         const budget = new ByteBudget();
         const attachmentMode = args.include_attachments ? 'all' : args.quote ? 'inline' : 'none';
         const source = await loadForwardSource(client, args.mailbox, args.uid, false, budget, attachmentMode);
@@ -819,7 +819,7 @@ function registerDeleteTools(server: McpServer, accounts: AccountManager, audit:
     handler(async ({ account, mailbox, uids, permanent }) => {
       accounts.assertCanDelete(account);
       return accounts.withClient(account, async (client, acc) => {
-        audit.assertNotLogFolder(client, mailbox);
+        audit.assertNotProtected(client, mailbox);
         const trash = permanent ? undefined : await findSpecialUse(client, '\\Trash');
         if (!permanent && !trash) {
           throw new ToolError('No Trash mailbox found. Use move_messages, or permanent=true to delete permanently.');
@@ -871,7 +871,7 @@ function registerDeleteTools(server: McpServer, accounts: AccountManager, audit:
       accounts.assertCanDelete(account);
       if (path.toUpperCase() === 'INBOX') throw new ToolError('INBOX cannot be deleted.');
       return accounts.withClient(account, async (client, acc) => {
-        audit.assertNotLogFolder(client, path);
+        audit.assertNotProtected(client, path);
         const status = await client.status(path, { messages: true }).catch(() => false as const);
         const result = await client.mailboxDelete(path);
         const log = await audit.write(client, acc, {
