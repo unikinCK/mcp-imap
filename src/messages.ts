@@ -32,8 +32,19 @@ function toIso(value?: Date | string): string | undefined {
   return Number.isNaN(date.getTime()) ? String(value) : date.toISOString();
 }
 
-function filenameOf(node: MessageStructureObject): string | undefined {
+export function filenameOf(node: MessageStructureObject): string | undefined {
   return node.dispositionParameters?.filename ?? node.parameters?.name;
+}
+
+/** Finds a body part by its part id ("1", "2.1"); a single-part message's body is part "1". */
+export function findPart(root: MessageStructureObject | undefined, part: string): MessageStructureObject | undefined {
+  if (!root) return undefined;
+  if (root.part === part || (!root.part && part === '1' && !root.childNodes)) return root;
+  for (const child of root.childNodes ?? []) {
+    const found = findPart(child, part);
+    if (found) return found;
+  }
+  return undefined;
 }
 
 /** Splits a BODYSTRUCTURE tree into the main text/html bodies and the attachments. */

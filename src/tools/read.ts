@@ -1,7 +1,9 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { SearchObject } from 'imapflow';
 import { z } from 'zod';
+import { type AttachmentLinker, resourceUri, uidValidityOf } from '../attachments.js';
 import type { ServerConfig } from '../config.js';
+import { detectKind, isTextDocument, optionalFeatures } from '../extract/index.js';
 import { type AccountManager, ToolError } from '../imap.js';
 import {
   analyzeStructure,
@@ -14,7 +16,7 @@ import {
   SUMMARY_QUERY,
   truncate,
 } from '../messages.js';
-import { accountArg, handler, json, mailboxArg } from './common.js';
+import { accountArg, handler, json, mailboxArg, structured } from './common.js';
 
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } as const;
 
@@ -23,7 +25,49 @@ const dateArg = z
   .regex(/^\d{4}-\d{2}-\d{2}/, 'Use YYYY-MM-DD')
   .optional();
 
-export function registerReadTools(server: McpServer, accounts: AccountManager, config: ServerConfig): void {
+const messageOutput = {
+  uid: z.number(),
+  mailbox: z.string(),
+  date: z.string().optional(),
+  from: z.array(z.string()).optional(),
+  to: z.array(z.string()).optional(),
+  cc: z.array(z.string()).optional(),
+  bcc: z.array(z.string()).optional(),
+  replyTo: z.array(z.string()).optional(),
+  subject: z.string(),
+  flags: z.array(z.string()),
+  size: z.number().optional(),
+  hasAttachments: z.boolean().optional(),
+  messageId: z.string().optional(),
+  inReplyTo: z.string().optional(),
+  references: z.string().optional(),
+  listUnsubscribe: z.string().optional(),
+  headers: z.record(z.string(), z.array(z.string())).optional(),
+  body: z.object({ text: z.string().optional(), html: z.string().optional() }),
+  bodyTruncated: z.boolean(),
+  attachments: z.array(
+    z.object({
+      part: z.string(),
+      filename: z.string().optional(),
+      contentType: z.string(),
+      size: z.number().optional(),
+      disposition: z.string().optional(),
+      contentId: z.string().optional(),
+      textAvailable: z.boolean().describe('get_attachment can return this attachment as text.'),
+      resourceUri: z.string(),
+      downloadUrl: z.string().optional(),
+    }),
+  ),
+  downloadExpiresAt: z.string().optional(),
+};
+
+export function registerReadTools(
+  server: McpServer,
+  accounts: AccountManager,
+  config: ServerConfig,
+  linker?: AttachmentLinker,
+): void {
+  const imageOcr = config.extract.ocr !== 'off' && optionalFeatures.tesseract;
   server.registerTool(
     'list_accounts',
     {
@@ -203,7 +247,8 @@ export function registerReadTools(server: McpServer, accounts: AccountManager, c
     {
       title: 'Get message',
       description:
-        'Fetches a single message: headers, decoded body and the list of attachments (with part ids for get_attachment). ' +
+        'Fetches a single message: headers, decoded body and the list of attachments (with part ids for get_attachment, ' +
+        'which returns PDF, Word, Excel and other documents as text). ' +
         'HTML-only messages are converted to plain text unless format is "html" or "both". Does not mark the message as read.',
       inputSchema: {
         account: accountArg,
@@ -218,10 +263,11 @@ export function registerReadTools(server: McpServer, accounts: AccountManager, c
           .describe(`Maximum body length in characters (default ${config.maxBodyChars}).`),
         include_headers: z.boolean().default(false).describe('Include all raw headers.'),
       },
+      outputSchema: messageOutput,
       annotations: READ_ONLY,
     },
     handler(async ({ account, mailbox, uid, format, max_chars, include_headers }) =>
-      accounts.withMailbox(account, mailbox, false, async (client) => {
+      accounts.withMailbox(account, mailbox, false, async (client, acc) => {
         const msg = await client.fetchOne(
           String(uid),
           {
@@ -253,7 +299,20 @@ export function registerReadTools(server: McpServer, accounts: AccountManager, c
 
         const headers = parseHeaders(msg.headers);
         const env = msg.envelope ?? {};
-        return json({
+        const uidValidity = uidValidityOf(client);
+        let downloadExpiresAt: string | undefined;
+        const attachmentList = attachments.map((a) => {
+          const link = linker?.({ account: acc.name, mailbox, uid, part: a.part, uidValidity, filename: a.filename });
+          downloadExpiresAt ??= link?.expiresAt;
+          const { kind } = detectKind(a.contentType, a.filename);
+          return {
+            ...a,
+            textAvailable: isTextDocument(a.contentType, a.filename) || (kind === 'image' && imageOcr),
+            resourceUri: resourceUri(acc.name, mailbox, uid, a.part),
+            ...(link ? { downloadUrl: link.url } : {}),
+          };
+        });
+        return structured({
           ...summarize(msg, mailbox),
           bcc: formatAddresses(env.bcc),
           replyTo: formatAddresses(env.replyTo),
@@ -263,64 +322,9 @@ export function registerReadTools(server: McpServer, accounts: AccountManager, c
           ...(include_headers ? { headers } : {}),
           body,
           bodyTruncated: truncated,
-          attachments,
+          attachments: attachmentList,
+          downloadExpiresAt,
         });
-      }),
-    ),
-  );
-
-  server.registerTool(
-    'get_attachment',
-    {
-      title: 'Get attachment',
-      description:
-        'Downloads one attachment / body part of a message by its part id (see get_message). ' +
-        'Text is returned as text, images as image content, everything else as a base64 embedded resource.',
-      inputSchema: {
-        account: accountArg,
-        mailbox: mailboxArg,
-        uid: z.number().int().positive(),
-        part: z.string().regex(/^[0-9]+(\.[0-9]+)*$/, 'Part id like "2" or "1.2"'),
-      },
-      annotations: READ_ONLY,
-    },
-    handler(async ({ account, mailbox, uid, part }) =>
-      accounts.withMailbox(account, mailbox, false, async (client, acc) => {
-        const limit = config.maxAttachmentBytes;
-        const { meta, data, truncated } = await downloadPart(client, uid, part, limit);
-        if (truncated) {
-          throw new ToolError(
-            `Attachment is larger than the configured limit of ${limit} bytes (MCP_IMAP_MAX_ATTACHMENT_BYTES).`,
-          );
-        }
-        const mimeType = (meta.contentType || 'application/octet-stream').toLowerCase();
-        const filename = meta.filename;
-        const info = { uid, mailbox, part, filename, contentType: mimeType, size: data.length };
-        if (mimeType.startsWith('text/') || mimeType === 'application/json' || mimeType.endsWith('+xml')) {
-          return {
-            content: [
-              { type: 'text', text: JSON.stringify(info) },
-              { type: 'text', text: data.toString('utf8') },
-            ],
-          };
-        }
-        if (/^image\/(png|jpe?g|gif|webp)$/.test(mimeType)) {
-          return {
-            content: [
-              { type: 'text', text: JSON.stringify(info) },
-              { type: 'image', data: data.toString('base64'), mimeType },
-            ],
-          };
-        }
-        const uri = `imap://${encodeURIComponent(acc.name)}/${encodeURIComponent(mailbox)}/${uid}/${part}${
-          filename ? `/${encodeURIComponent(filename)}` : ''
-        }`;
-        return {
-          content: [
-            { type: 'text', text: JSON.stringify(info) },
-            { type: 'resource', resource: { uri, mimeType, blob: data.toString('base64') } },
-          ],
-        };
       }),
     ),
   );

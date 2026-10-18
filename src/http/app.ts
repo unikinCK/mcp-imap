@@ -9,6 +9,7 @@ import type { ServerConfig } from '../config.js';
 import { ConnectionPool } from '../imap.js';
 import { createServer } from '../server.js';
 import type { HttpConfig } from './config.js';
+import { downloadLinker, downloadRouter } from './download.js';
 import { grantableScopes, ImapOAuthProvider, permissions, SCOPES } from './oauth.js';
 import { Store } from './store.js';
 import { webRouter } from './web.js';
@@ -102,9 +103,11 @@ export function createHttpApp(config: HttpConfig, store = new Store(config.dbPat
         accounts: store.accountConfigs(userId),
         maxBodyChars: config.maxBodyChars,
         maxAttachmentBytes: config.maxAttachmentBytes,
+        extract: config.extract,
       };
       ({ server } = createServer(serverConfig, {
         pool: poolFor(userId),
+        attachmentLinker: downloadLinker(config, userId),
         noAccountsHint: `No mail account configured. Add one at ${new URL('/account', config.publicUrl).href}`,
       }));
       // Stateless Streamable HTTP: one MCP server instance per request, scoped to the token's user and permissions.
@@ -131,6 +134,7 @@ export function createHttpApp(config: HttpConfig, store = new Store(config.dbPat
   app.get('/mcp', mcpCors, methodNotAllowed);
   app.delete('/mcp', mcpCors, methodNotAllowed);
 
+  if (config.downloadLinks) app.use(downloadRouter({ config, store, poolFor }));
   app.use(webRouter({ store, config, onUserChanged: dropPool }));
 
   return {

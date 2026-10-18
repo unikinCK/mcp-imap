@@ -60,6 +60,26 @@ export interface AccountConfig {
   access: AccessLevel;
 }
 
+/** Limits and options for turning attachments into text (see src/extract). */
+export interface ExtractConfig {
+  /** Time limit for one extraction (parsing a PDF, Word or Excel file). */
+  timeoutMs: number;
+  /** Heap limit of the extraction worker, protects against decompression bombs. */
+  memoryMb: number;
+  /** OCR for scanned PDFs and images: "auto" uses it when the optional packages are installed. */
+  ocr: 'auto' | 'off';
+  /** Tesseract language codes joined with "+", e.g. "deu+eng". */
+  ocrLangs: string;
+  /** Directory or URL with <lang>.traineddata(.gz) files; default: bundled packages or the tesseract CDN. */
+  ocrLangPath?: string;
+  /** Maximum number of pages OCR'd per request. */
+  ocrMaxPages: number;
+  /** Time limit for one OCR run. */
+  ocrTimeoutMs: number;
+  /** Maximum number of PDF pages rendered as images per request. */
+  renderMaxPages: number;
+}
+
 export interface ServerConfig {
   mode: Mode;
   allowSend: boolean;
@@ -72,6 +92,9 @@ export interface ServerConfig {
   accounts: AccountConfig[];
   maxBodyChars: number;
   maxAttachmentBytes: number;
+  extract: ExtractConfig;
+  /** Local directory for save_attachment (stdio only); undefined hides the tool. */
+  downloadDir?: string;
 }
 
 export class ConfigError extends Error {}
@@ -105,13 +128,20 @@ Environment (single account, used when no --config is given):
   SMTP_FROM, SMTP_SAVE_TO_SENT (true)
   MCP_IMAP_MODE, MCP_IMAP_CONFIG, MCP_IMAP_ALLOW_SEND (true), MCP_IMAP_ALLOW_DELETE (true),
   MCP_IMAP_LOG_FOLDER ("MCP Log"; "off" disables the audit log),
-  MCP_IMAP_MAX_BODY_CHARS (50000), MCP_IMAP_MAX_ATTACHMENT_BYTES (10485760)
+  MCP_IMAP_MAX_BODY_CHARS (50000), MCP_IMAP_MAX_ATTACHMENT_BYTES (10485760),
+  MCP_IMAP_DOWNLOAD_DIR (enables save_attachment; stdio only)
+
+Environment (attachment text extraction):
+  MCP_IMAP_EXTRACT_TIMEOUT (30 seconds), MCP_IMAP_EXTRACT_MEMORY_MB (512),
+  MCP_IMAP_OCR (auto; "off" disables OCR), MCP_IMAP_OCR_LANGS (deu+eng), MCP_IMAP_OCR_LANG_PATH,
+  MCP_IMAP_OCR_MAX_PAGES (10), MCP_IMAP_OCR_TIMEOUT (180 seconds), MCP_IMAP_RENDER_MAX_PAGES (5)
 
 Environment (HTTP server, "serve"):
   MCP_IMAP_PUBLIC_URL (https://... as seen by clients), MCP_IMAP_SECRET_KEY (required),
   MCP_IMAP_HTTP_HOST (127.0.0.1), MCP_IMAP_HTTP_PORT (3000), MCP_IMAP_TLS_CERT, MCP_IMAP_TLS_KEY,
   MCP_IMAP_DB (./data/mcp-imap.db), MCP_IMAP_ALLOW_REGISTRATION (false), MCP_IMAP_TRUST_PROXY (false),
-  MCP_IMAP_ACCESS_TOKEN_TTL (3600), MCP_IMAP_REFRESH_TOKEN_TTL (2592000)
+  MCP_IMAP_ACCESS_TOKEN_TTL (3600), MCP_IMAP_REFRESH_TOKEN_TTL (2592000),
+  MCP_IMAP_DOWNLOAD_LINKS (true), MCP_IMAP_DOWNLOAD_TTL (600 seconds)
 `;
 
 export function helpText(): string {
@@ -319,6 +349,7 @@ export interface BaseConfig {
   logFolder?: string;
   maxBodyChars: number;
   maxAttachmentBytes: number;
+  extract: ExtractConfig;
 }
 
 function parseLogFolder(value: string | undefined): string | undefined {
@@ -338,6 +369,26 @@ export function loadBaseConfig(args: CliArgs, env: NodeJS.ProcessEnv = process.e
     logFolder: parseLogFolder(env.MCP_IMAP_LOG_FOLDER),
     maxBodyChars: parseInt10(env.MCP_IMAP_MAX_BODY_CHARS, 50_000, 'MCP_IMAP_MAX_BODY_CHARS'),
     maxAttachmentBytes: parseInt10(env.MCP_IMAP_MAX_ATTACHMENT_BYTES, 10 * 1024 * 1024, 'MCP_IMAP_MAX_ATTACHMENT_BYTES'),
+    extract: loadExtractConfig(env),
+  };
+}
+
+function loadExtractConfig(env: NodeJS.ProcessEnv): ExtractConfig {
+  const ocr = (env.MCP_IMAP_OCR ?? 'auto').trim().toLowerCase();
+  if (!['auto', 'on', 'true', 'off', 'false', 'no', '0'].includes(ocr)) {
+    throw new ConfigError(`Invalid value for MCP_IMAP_OCR: ${env.MCP_IMAP_OCR}. Use "auto" or "off".`);
+  }
+  const langs = (env.MCP_IMAP_OCR_LANGS || 'deu+eng').trim();
+  if (!/^[a-z_]+(\+[a-z_]+)*$/i.test(langs)) throw new ConfigError(`Invalid MCP_IMAP_OCR_LANGS: ${langs}`);
+  return {
+    timeoutMs: parseInt10(env.MCP_IMAP_EXTRACT_TIMEOUT, 30, 'MCP_IMAP_EXTRACT_TIMEOUT') * 1000,
+    memoryMb: parseInt10(env.MCP_IMAP_EXTRACT_MEMORY_MB, 512, 'MCP_IMAP_EXTRACT_MEMORY_MB'),
+    ocr: ['off', 'false', 'no', '0'].includes(ocr) ? 'off' : 'auto',
+    ocrLangs: langs,
+    ocrLangPath: env.MCP_IMAP_OCR_LANG_PATH || undefined,
+    ocrMaxPages: parseInt10(env.MCP_IMAP_OCR_MAX_PAGES, 10, 'MCP_IMAP_OCR_MAX_PAGES'),
+    ocrTimeoutMs: parseInt10(env.MCP_IMAP_OCR_TIMEOUT, 180, 'MCP_IMAP_OCR_TIMEOUT') * 1000,
+    renderMaxPages: parseInt10(env.MCP_IMAP_RENDER_MAX_PAGES, 5, 'MCP_IMAP_RENDER_MAX_PAGES'),
   };
 }
 
@@ -345,5 +396,10 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
   const args = parseArgs(argv);
   const configPath = args.configPath ?? env.MCP_IMAP_CONFIG;
   const accounts = configPath ? accountsFromFile(configPath, env) : [accountFromEnv(env)];
-  return { ...loadBaseConfig(args, env), actor: 'local stdio client', accounts };
+  return {
+    ...loadBaseConfig(args, env),
+    actor: 'local stdio client',
+    accounts,
+    downloadDir: env.MCP_IMAP_DOWNLOAD_DIR?.trim() || undefined,
+  };
 }
