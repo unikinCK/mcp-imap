@@ -85,6 +85,8 @@ General settings:
 | `MCP_IMAP_ALLOW_SEND` | `true` | Set to `false` to hide `send_email` in read-write mode (same as `--no-send`) |
 | `MCP_IMAP_ALLOW_DELETE` | `true` | Set to `false` to disallow deleting messages and folders (same as `--no-delete`) |
 | `MCP_IMAP_LOG_FOLDER` | `MCP Log` | Folder for the audit log of all changes; `off` disables it |
+| `MCP_IMAP_NOTES_FOLDER` | `MCP Notes` | Folder for the [mailbox notes](#mailbox-notes-and-instance-guide); `off` disables them |
+| `MCP_IMAP_SKILL_FILE` | – | Markdown file with instructions for this instance, appended to `get_skill` |
 | `MCP_IMAP_MAX_BODY_CHARS` | `50000` | Default maximum length of a returned message body |
 | `MCP_IMAP_MAX_ATTACHMENT_BYTES` | `10485760` | Maximum attachment size returned by `get_attachment` |
 | `MCP_IMAP_DOWNLOAD_DIR` | – | Enables `save_attachment`, which writes attachments into this local directory (stdio only) |
@@ -298,6 +300,8 @@ The commands use `MCP_IMAP_DB`; they do not need the secret key.
 | `get_message` | Headers, decoded body (text / html / both), attachment list with `textAvailable`, `resourceUri` and (HTTP) `downloadUrl` |
 | `get_attachment` | An attachment by part id: PDF, Word, Excel, attached e-mails, HTML and text as **plain text**; images, rendered PDF pages, the original file or just links on request (see [Attachments](#attachments)) |
 | `save_attachment` | Save attachments of a message as files into `MCP_IMAP_DOWNLOAD_DIR` (stdio, only if configured) |
+| `get_skill` | Guide to this instance: mailboxes and their permissions, workflows, rules and the instance instructions (also as resource `mcp-imap://skill` and prompt `mail_assistant`) |
+| `get_notes` | Notes of a mailbox: rules on how to handle its messages (optionally only those for one folder) |
 
 ### Read-write mode only
 
@@ -312,6 +316,7 @@ The commands use `MCP_IMAP_DB`; they do not need the secret key.
 | `save_draft` | Compose a message (optionally as a reply, with attachments) and store it in Drafts |
 | `reply_message` | Reply like a mail client: recipient from Reply-To/From, `reply_all` (without your own addresses), `Re:` subject, threading headers, original quoted below (`>` / blockquote, header in English or German), optionally with the original attachments. Saved as draft by default; `send: true` sends it (needs send permission) and flags the original as answered |
 | `forward_messages` | Forward one or more messages as a draft in Drafts – inline with all original attachments (incl. inline images) or as `.eml` attachment. Everything is copied on the server, so large PDFs work too |
+| `save_note` / `delete_note` | Save, replace (`replace_id`) or delete a note of a mailbox |
 | `send_email` | Send via SMTP, store a copy in Sent, flag the original as answered when replying. Only available if SMTP is configured and sending is not disabled |
 
 `save_draft`, `send_email`, `reply_message` and `forward_messages` accept `attach_from_messages` (`[{ mailbox, uid, part? }]`) to reuse attachments of existing messages – copied on the server (max. 25 MB per draft), without passing file contents through the conversation.
@@ -341,6 +346,19 @@ Every MCP client can show text, but support for images, embedded files and links
 - **MCP resources:** every attachment has a URI `imap://{account}/{mailbox}/{uid}/{part}` that clients with resource support can read via `resources/read` (original file).
 - **Download links (HTTP server):** `get_message` and `get_attachment` return a `downloadUrl` like `https://mail.example.com/attachments/<token>/Rechnung.pdf`. The signed token is the only credential, so code sandboxes, n8n, Zapier or `curl` can fetch the original file without the OAuth token. A link is valid for `MCP_IMAP_DOWNLOAD_TTL` seconds (10 minutes), works only for this one attachment of this user, stops working when the mailbox's UIDVALIDITY changes, and is served with `Content-Security-Policy: sandbox` and `nosniff`. Each download is written to the server log and, for writable mailboxes, to the `MCP Log` folder. Treat links like passwords while they are valid; disable them with `MCP_IMAP_DOWNLOAD_LINKS=false`.
 - **Local files (stdio):** with `MCP_IMAP_DOWNLOAD_DIR=/path` the tool `save_attachment` saves all or selected attachments of a message into that directory (sanitized file names, existing files are never overwritten unless `overwrite: true`) and returns path, size and SHA-256 of each file.
+
+## Mailbox notes and instance guide
+
+**Notes** are rules and reminders on how the messages of one mailbox should be handled, e.g. "newsletters go to *95 Newsletter & Werbung*" or "invoices must be addressed to unikin GmbH". The model reads them with `get_notes` before working on a mailbox and stores new rules with `save_note` when the user states them. Notes are saved as messages in the `MCP Notes` folder **of that mailbox**:
+
+- They apply to every client, every session and both server modes, and move with the mailbox.
+- You can read them in any mail client.
+- A note can apply to the whole mailbox or to one folder (`folder`).
+- Only the notes tools can change the folder; `move_messages`, `update_flags` etc. reject it.
+- Each change is written to the `MCP Log` folder.
+- Saving and deleting needs write access to the mailbox (organize level); read-only clients can read notes.
+
+**`get_skill`** returns a Markdown guide to the instance. It is built from the actual configuration (server mode, mailboxes with their access level, whether OCR, download links and notes are available) and lists workflows and rules. The content of `MCP_IMAP_SKILL_FILE` is appended as "Instructions for this instance". Use the file for house rules such as filing conventions or tone of replies. The file is read on every call, so changes apply without a restart. Clients that support MCP resources or prompts also get the guide as `mcp-imap://skill` and the prompt `mail_assistant`. The server instructions tell the model to call `get_skill` first.
 
 ## Security notes
 

@@ -87,6 +87,10 @@ export interface ServerConfig {
   allowDelete: boolean;
   /** Folder that receives the audit log of all changing actions; undefined disables logging. */
   logFolder?: string;
+  /** Folder with the notes (handling rules) of each mailbox; undefined disables notes. */
+  notesFolder?: string;
+  /** Markdown file with instance-specific instructions, appended to get_skill. */
+  skillFile?: string;
   /** Who performs the actions, written to the audit log. */
   actor?: string;
   accounts: AccountConfig[];
@@ -128,6 +132,8 @@ Environment (single account, used when no --config is given):
   SMTP_FROM, SMTP_SAVE_TO_SENT (true)
   MCP_IMAP_MODE, MCP_IMAP_CONFIG, MCP_IMAP_ALLOW_SEND (true), MCP_IMAP_ALLOW_DELETE (true),
   MCP_IMAP_LOG_FOLDER ("MCP Log"; "off" disables the audit log),
+  MCP_IMAP_NOTES_FOLDER ("MCP Notes"; "off" disables mailbox notes),
+  MCP_IMAP_SKILL_FILE (Markdown with instance-specific instructions for get_skill),
   MCP_IMAP_MAX_BODY_CHARS (50000), MCP_IMAP_MAX_ATTACHMENT_BYTES (10485760),
   MCP_IMAP_DOWNLOAD_DIR (enables save_attachment; stdio only)
 
@@ -347,13 +353,15 @@ export interface BaseConfig {
   allowSend: boolean;
   allowDelete: boolean;
   logFolder?: string;
+  notesFolder?: string;
+  skillFile?: string;
   maxBodyChars: number;
   maxAttachmentBytes: number;
   extract: ExtractConfig;
 }
 
-function parseLogFolder(value: string | undefined): string | undefined {
-  if (value === undefined) return 'MCP Log';
+function parseFolder(value: string | undefined, fallback: string): string | undefined {
+  if (value === undefined) return fallback;
   const v = value.trim();
   if (!v || ['off', 'none', 'false', '0', 'no'].includes(v.toLowerCase())) return undefined;
   return v;
@@ -366,7 +374,9 @@ export function loadBaseConfig(args: CliArgs, env: NodeJS.ProcessEnv = process.e
     mode: args.mode ?? (env.MCP_IMAP_MODE ? parseMode(env.MCP_IMAP_MODE, 'MCP_IMAP_MODE') : 'read-only'),
     allowSend: !args.noSend && parseBool(env.MCP_IMAP_ALLOW_SEND, true, 'MCP_IMAP_ALLOW_SEND'),
     allowDelete: !args.noDelete && parseBool(env.MCP_IMAP_ALLOW_DELETE, true, 'MCP_IMAP_ALLOW_DELETE'),
-    logFolder: parseLogFolder(env.MCP_IMAP_LOG_FOLDER),
+    logFolder: parseFolder(env.MCP_IMAP_LOG_FOLDER, 'MCP Log'),
+    notesFolder: parseFolder(env.MCP_IMAP_NOTES_FOLDER, 'MCP Notes'),
+    skillFile: env.MCP_IMAP_SKILL_FILE?.trim() || undefined,
     maxBodyChars: parseInt10(env.MCP_IMAP_MAX_BODY_CHARS, 50_000, 'MCP_IMAP_MAX_BODY_CHARS'),
     maxAttachmentBytes: parseInt10(env.MCP_IMAP_MAX_ATTACHMENT_BYTES, 10 * 1024 * 1024, 'MCP_IMAP_MAX_ATTACHMENT_BYTES'),
     extract: loadExtractConfig(env),

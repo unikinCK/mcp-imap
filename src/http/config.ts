@@ -6,6 +6,8 @@ export interface HttpConfig {
   allowSend: boolean;
   allowDelete: boolean;
   logFolder?: string;
+  notesFolder?: string;
+  skillFile?: string;
   publicUrl: URL;
   host: string;
   port: number;

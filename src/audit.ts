@@ -1,6 +1,7 @@
 import type { ImapFlow } from 'imapflow';
 import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 import type { AccountConfig } from './config.js';
+import { isFolder, resolveFolder } from './folders.js';
 import { ToolError } from './imap.js';
 import { formatAddresses } from './messages.js';
 
@@ -35,46 +36,36 @@ export class AuditLog {
     readonly folder: string | undefined,
     /** Who performs the actions, e.g. "Claude (user christoph)". */
     private readonly actor: string,
+    /** Folder with the mailbox notes, which only the notes tools may change. */
+    private readonly notesFolder?: string,
   ) {}
 
   get enabled(): boolean {
     return Boolean(this.folder);
   }
 
-  private candidates(client: ImapFlow): string[] {
-    if (!this.folder) return [];
-    const prefix = client.namespace?.prefix ?? '';
-    const names = [this.folder.toLowerCase()];
-    if (prefix && !this.folder.toLowerCase().startsWith(prefix.toLowerCase())) names.push(`${prefix}${this.folder}`.toLowerCase());
-    return names;
-  }
-
   /** True if the path is the log folder, which must not be modified through the tools. */
   isLogFolder(client: ImapFlow, path: string | undefined): boolean {
-    if (!this.folder || !path) return false;
-    return this.candidates(client).includes(path.toLowerCase());
+    return isFolder(client, this.folder, path);
   }
 
-  assertNotLogFolder(client: ImapFlow, ...paths: (string | undefined)[]): void {
+  /** Rejects the audit log folder and the notes folder as source or target of generic tools. */
+  assertNotProtected(client: ImapFlow, ...paths: (string | undefined)[]): void {
     for (const path of paths) {
       if (this.isLogFolder(client, path)) {
         throw new ToolError(`"${path}" is the audit log folder. It can be read but not modified through this server.`);
       }
+      if (isFolder(client, this.notesFolder, path)) {
+        throw new ToolError(`"${path}" holds the mailbox notes. Change them with save_note and delete_note.`);
+      }
     }
   }
 
-  /** Finds the existing log folder or creates it (inside the personal namespace if the server requires one). */
+  /** Finds the existing log folder or creates it. */
   private async resolve(client: ImapFlow): Promise<string> {
     const cached = this.resolved.get(client);
     if (cached) return cached;
-    const wanted = this.candidates(client);
-    const existing = (await client.list()).find((box) => wanted.includes(box.path.toLowerCase()));
-    let path = existing?.path;
-    if (!path) {
-      const prefix = client.namespace?.prefix ?? '';
-      path = prefix && !this.folder!.startsWith(prefix) ? `${prefix}${this.folder}` : this.folder!;
-      await client.mailboxCreate(path);
-    }
+    const path = (await resolveFolder(client, this.folder!, true))!;
     this.resolved.set(client, path);
     return path;
   }

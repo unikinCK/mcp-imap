@@ -80,6 +80,7 @@ export function registerReadTools(
       json({
         mode: config.mode,
         auditLogFolder: config.mode === 'read-write' ? config.logFolder : undefined,
+        notesFolder: config.notesFolder,
         accounts: accounts.list().map((a) => ({
           name: a.name,
           user: a.imap.user,
